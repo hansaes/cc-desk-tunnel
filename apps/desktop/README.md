@@ -33,6 +33,8 @@ npm.cmd run package:windows
 
 Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自签证书填写 SHA256 指纹，可信域名证书将指纹留空使用 CA / 有效期 / 主机名验证。不需要 Ubuntu SSH 账号。主进程完成 TLS 身份验证后才发送 token，接收独立 frp 证书与配置后生成临时 SSH key / host key，启动环回 sshd / frpc，Linux 探测成功才进入工作区。
 
+连接跟随 Windows 的系统代理设置（手动、脚本或自动检测，由 Electron 按目标地址解析）：设置里给出 HTTP 代理时，控制连接、安装包下载和 frpc 都经它的 CONNECT 隧道到达服务端，证书校验与直连时相同，代理只转发密文；没有代理、目标被设置排除或只给出 SOCKS 代理时直接连接。不支持需要账号密码的代理。
+
 `prepare-ssh.ps1` 显式以 UTF-8 输出连接 JSON，与主进程的解码方式一致，不受 Windows 当前控制台代码页影响；安装路径含中文、空格时也保留完整的 PowerShell 路径。
 
 `component-host.ps1` 用 Windows 原生 Job Object 管理 sshd、frpc 及子进程。每次连接使用随机回环端口和独立临时配置 / 主机与登录密钥。正常断连、关闭应用、组件启动失败会结束进程并删除临时目录；客户端异常退出也会回收监听。操作系统强杀整棵进程树可能绕过文件清理，留下不可再用于登录的临时文件，崩溃残留清理待后续处理。不安装、保留任何项目系统服务，不修改注册表、默认 shell / 终端或防火墙。
@@ -58,6 +60,7 @@ Electron 选择“远程代理”，输入可信 WSS 地址、代理 token；自
 | `src/ui.tsx`、`paths.ts` | 图标按钮 / 对话框 / 菜单；Windows 路径比较 |
 | `electron/main.cjs`、`preload.cjs` | 窗口、IPC（选目录、普通会话目录、打开授权页、连接）和暴露给页面的 `window.desktop` |
 | `electron/proxy-bridge.mjs`、`windows-tunnel.mjs` | 主进程连接桥：校验服务证书后转发 WSS，并按服务端下发的配置启动本机隧道 |
+| `electron/system-proxy.mjs` | 读出系统代理中的 HTTP 代理，并经它建立到服务端的 TCP 连接 |
 | `electron/prepare-ssh.ps1`、`component-host.ps1` | 生成临时 SSH 配置；用 Job Object 托管 sshd / frpc |
 
 `test/` 是 Playwright 界面测试，`test-main/` 是主进程模块与 `client.ts` 的 Node 测试。新增界面状态先看能否放进所属区域的组件，跨区域才上提到 `App.tsx`。

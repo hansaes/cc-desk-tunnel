@@ -8,6 +8,7 @@ import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
 import { startWindowsTunnel } from './windows-tunnel.mjs';
+import { httpProxy, openSocket } from './system-proxy.mjs';
 
 export function certificateMatches(observed, trusted) {
   if (typeof trusted !== 'string' || typeof observed !== 'string') return false;
@@ -20,27 +21,31 @@ export function controlTlsOptions(config) {
     throw new Error('请输入可信安装信息中的 SHA256 证书指纹，或留空使用 CA 验证。');
   return { rejectUnauthorized: false };
 }
+// Starts TLS with the service, through the system's HTTP proxy when the Windows settings name one for it. The proxy
+// only relays bytes: the certificate is still the service's own and is judged as on a direct connection.
+async function connectService(address, config, resolveProxy) {
+  const port = Number(address.port || 443);
+  const proxy = httpProxy(await resolveProxy?.(`https://${address.hostname}:${port}`));
+  return connect({
+    socket: await openSocket(proxy, address.hostname, port),
+    servername: isIP(address.hostname) ? undefined : address.hostname,
+    ...controlTlsOptions(config),
+  });
+}
 // An HTTPS GET carrying the service token. A pinned certificate is checked once the connection stands and before
 // the request, and with it the token, is written to it.
-export async function authorizedGet(address, config, path, token) {
-  const socket = await new Promise((resolve, reject) => {
-    const socket = connect(
-      {
-        host: address.hostname,
-        port: Number(address.port || 443),
-        servername: isIP(address.hostname) ? undefined : address.hostname,
-        ...controlTlsOptions(config),
-      },
-      () => {
-        if (
-          config.fingerprint &&
-          !certificateMatches(socket.getPeerCertificate().fingerprint256, config.fingerprint)
-        ) {
-          socket.destroy();
-          reject(new Error('服务证书指纹不匹配；未发送服务凭据。'));
-        } else resolve(socket);
-      },
-    );
+export async function authorizedGet(address, config, path, token, resolveProxy) {
+  const socket = await connectService(address, config, resolveProxy);
+  await new Promise((resolve, reject) => {
+    socket.once('secureConnect', () => {
+      if (
+        config.fingerprint &&
+        !certificateMatches(socket.getPeerCertificate().fingerprint256, config.fingerprint)
+      ) {
+        socket.destroy();
+        reject(new Error('服务证书指纹不匹配；未发送服务凭据。'));
+      } else resolve();
+    });
     socket.once('error', reject);
   });
   return new Promise((resolve, reject) => {
@@ -72,7 +77,8 @@ export async function openProxyBridge(
     address.hash
   )
     throw new Error('原生模式需要不含凭据的 WSS 地址。');
-  const tlsOptions = controlTlsOptions(config);
+  // A malformed pin is refused here, before anything listens or connects.
+  controlTlsOptions(config);
   const nonce = randomBytes(32).toString('hex');
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
@@ -96,7 +102,15 @@ export async function openProxyBridge(
   });
   wss.on('connection', (local) => {
     // CA verification completes at TLS handshake; explicit pins are checked before sending credentials.
-    const remote = new WebSocket(address, tlsOptions);
+    const remote = new WebSocket(address, {
+      // Node's HTTP client also takes the connection through this callback once it is ready.
+      createConnection: (_options, created) => {
+        connectService(address, config, binaries.resolveProxy).then(
+          (socket) => created(null, socket),
+          created,
+        );
+      },
+    });
     pair = { local, remote, controller: new AbortController(), tunnel: null, preparing: null };
     const current = pair;
     const queue = [];
@@ -220,7 +234,13 @@ export async function openProxyBridge(
     if (!release || !token) throw new Error('服务端没有提供客户端安装包。');
     const expected = release;
     const target = join(directory, `CC-Desk-Tunnel-Setup-${expected.version}-x64.exe`);
-    const response = await authorizedGet(address, config, '/client/installer', token);
+    const response = await authorizedGet(
+      address,
+      config,
+      '/client/installer',
+      token,
+      binaries.resolveProxy,
+    );
     if (response.statusCode !== 200) {
       response.resume();
       throw new Error(`安装包下载失败（${response.statusCode}）。`);
