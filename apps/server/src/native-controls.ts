@@ -143,9 +143,10 @@ export async function nativeMetrics(
   const windows = usage?.rate_limits
     ? Object.entries(usage.rate_limits).flatMap(([name, value]) => {
         if (!value || name === 'extra_usage') return [];
+        // Per-model weekly rows (a Max plan's Fable limit) are named after the weekly window they belong to.
         if (name === 'model_scoped' && Array.isArray(value))
           return value.map((item) => ({
-            name: item.display_name,
+            name: `seven_day:${item.display_name}`,
             utilization: item.utilization,
             resetsAt: item.resets_at,
           }));

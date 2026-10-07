@@ -156,6 +156,8 @@ handle('proxy:connect', async (event, config) => {
       scriptDirectory: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar.unpacked/electron')
         : undefined,
+      // The Windows proxy settings (manual, script or automatic detection) as Chromium reads them.
+      resolveProxy: (url) => session.defaultSession.resolveProxy(url),
     },
     () => {
       if (bridge !== connection) return;

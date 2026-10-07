@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connect, createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
+import { httpProxy } from './system-proxy.mjs';
 
 function execute(file, args) {
   return new Promise((resolve, reject) => {
@@ -123,6 +124,11 @@ export async function startWindowsTunnel(configuration, binaries, signal, onFail
         String(port),
       ]),
     );
+    const proxy = httpProxy(
+      await binaries.resolveProxy?.(
+        `https://${configuration.serverAddr}:${configuration.serverPort}`,
+      ),
+    );
     check();
     const caPath = join(directory, 'server.crt');
     await writeFile(caPath, configuration.certificate, 'utf8');
@@ -135,6 +141,8 @@ export async function startWindowsTunnel(configuration, binaries, signal, onFail
         loginFailExit: true,
         auth: { method: 'token', token: configuration.token },
         transport: {
+          // The execution channel takes the same system proxy as the control connection.
+          ...(proxy && { proxyURL: `http://${proxy.host}:${proxy.port}` }),
           tls: { enable: true, trustedCaFile: caPath, serverName: configuration.serverName },
         },
         proxies: [

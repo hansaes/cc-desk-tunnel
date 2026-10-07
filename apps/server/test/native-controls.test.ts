@@ -225,7 +225,11 @@ test('native quota windows retain reset times and per-model rows without exposin
         rate_limits_available: true,
         rate_limits: {
           five_hour: { utilization: 37, resets_at: '2026-10-02T15:00:00Z' },
-          model_scoped: [{ display_name: 'Test model', utilization: null, resets_at: null }],
+          seven_day: { utilization: 12, resets_at: '2026-10-09T15:00:00Z' },
+          model_scoped: [
+            { display_name: 'Fable', utilization: 41, resets_at: '2026-10-09T15:00:00Z' },
+            { display_name: 'Test model', utilization: null, resets_at: null },
+          ],
           extra_usage: { is_enabled: true, used_credits: 1234 },
         },
       };
@@ -235,6 +239,8 @@ test('native quota windows retain reset times and per-model rows without exposin
   assert.ok(metrics.type === 'native.metrics');
   assert.deepEqual(metrics.rateLimits?.windows, [
     { name: 'five_hour', utilization: 37, resetsAt: '2026-10-02T15:00:00Z' },
-    { name: 'Test model', utilization: null, resetsAt: null },
+    { name: 'seven_day', utilization: 12, resetsAt: '2026-10-09T15:00:00Z' },
+    { name: 'seven_day:Fable', utilization: 41, resetsAt: '2026-10-09T15:00:00Z' },
+    { name: 'seven_day:Test model', utilization: null, resetsAt: null },
   ]);
 });

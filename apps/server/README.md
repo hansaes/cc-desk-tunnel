@@ -25,7 +25,7 @@ Linux 上的代理服务：认证客户端、管理会话、驱动官方 Claude 
 - 工具进度来自原生 `tool_progress`；Bash 输出按原生工具结果展示，不承诺每行 stdout 实时接出。
 - 原生 session ID / resume / abort 均由官方组件管理。改名 / 删除已有原生会话先调用官方 renameSession / deleteSession，再更新代理索引；原生更新失败保留代理记录，运行中禁止管理。
 - 默认请求原生 auto，可选 default / plan / acceptEdits；回传 requested / actual 模式，不自建 AI 审批。原生 canUseTool 仍转发需要用户的请求。
-- `src/native-controls.ts` 转接初始化的模型目录、命名账号字段、原生上下文摘要与用量；实验额度接口独立隔离、五秒超时，状态获取失败不让完成的任务失败。累计 token / CLI 费用估算不冒充当前上下文 / 提供方账单；API 无订阅额度时明确不可用。
+- `src/native-controls.ts` 转接初始化的模型目录、命名账号字段、原生上下文摘要与用量；实验额度接口独立隔离、五秒超时，状态获取失败不让完成的任务失败。按模型的每周额度（如 Max 订阅的 Fable）以 `seven_day:<模型>` 命名，与其他每周窗口一样划分统计周期。累计 token / CLI 费用估算不冒充当前上下文 / 提供方账单；API 无订阅额度时明确不可用。
 - 会话 model / effort 偏好在下轮传给 SDK，实际值仅按原生报告展示。主动压缩发送原生 `/compact`，转接真实 compact boundary，不自行总结上下文。
 - 原生持久化开启；恢复前官方 getSessionInfo 验证上下文存在，不存在则明确失败，不用 GUI 历史重建。每轮回传原生保存状态。
 - 不改 CLI 或注入代码；已安装可执行文件与官方同版本 Linux 包 SHA256 一致，实际进程 / 环境核对见[原生运行](../../docs/native-runtime.md)。

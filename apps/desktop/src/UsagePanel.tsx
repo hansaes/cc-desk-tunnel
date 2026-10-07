@@ -4,13 +4,16 @@ import type { UsagePage, UsageSummary } from '@cc-desk-tunnel/protocol';
 import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
 
-export const quotaNames: Record<string, string> = {
+const quotaNames: Record<string, string | undefined> = {
   five_hour: '5 小时额度',
   seven_day: '每周额度',
   seven_day_opus: 'Opus 每周额度',
   seven_day_sonnet: 'Sonnet 每周额度',
   seven_day_oauth_apps: '应用每周额度',
 };
+// The service names a per-model weekly window `seven_day:<model>`, as the account's plan reports it.
+export const quotaName = (name: string) =>
+  quotaNames[name] ?? (name.startsWith('seven_day:') ? `${name.slice(10)} 每周额度` : undefined);
 const compact = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
 export const tokens = (value: number) =>
   value < 10000 ? value.toLocaleString('zh-CN') : compact.format(value);
@@ -156,8 +159,8 @@ export default function UsagePanel({
           <div className="segmented" role="group" aria-label="时间范围">
             {[
               ...(summary?.windows
-                .filter((window) => quotaNames[window.name])
-                .map((window) => [window.name, `本期${quotaNames[window.name]}`] as const) ?? []),
+                .filter((window) => quotaName(window.name))
+                .map((window) => [window.name, `本期${quotaName(window.name)}`] as const) ?? []),
               ...presets,
             ].map(([value, label]) => (
               <button
