@@ -18,7 +18,7 @@ import type {
   NativeMetrics,
   UsageSummary,
 } from '@cc-desk-tunnel/protocol';
-import UsagePanel, { dollars, quotaNames, tokens } from './UsagePanel.tsx';
+import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
 import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
 
@@ -264,7 +264,7 @@ export default function AccountPanel({
             {metrics.rateLimits.windows.map((window, index) => (
               <div className="quota-row" key={`${window.name}:${index}`}>
                 <div>
-                  <strong>{quotaNames[window.name] ?? window.name}</strong>
+                  <strong>{quotaName(window.name) ?? window.name}</strong>
                   <span>
                     {window.utilization == null
                       ? '使用量未提供'
