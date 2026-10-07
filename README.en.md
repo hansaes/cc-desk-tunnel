@@ -42,6 +42,8 @@ Windows: PowerShell 7 reads and writes files, runs commands; results return to C
 - SSH keys are generated for each connection and destroyed when it ends; nothing is installed as a permanent service on Windows.
 - The project is glue on top of the official Agent SDK and the unmodified official Claude Code: it does not change the CLI or replace its tools, approvals or context management. Sessions and long-term memory are kept by Claude Code itself on the server.
 
+This repository publishes all of its own client, server, build and deployment source, with no separate closed-source features. **This does not make Claude Code open source**: the official CLI and Agent SDK are installed from official channels and remain subject to Anthropic's terms. Bundled third-party components retain their own licenses; see [NOTICE](NOTICE).
+
 ## Features
 
 | | |
@@ -128,7 +130,7 @@ That describes the structure. **It is not a guarantee about your account.** Keep
 ## Antivirus and SmartScreen
 
 - **frpc may be flagged.** The client bundles `frpc.exe` from [frp](https://github.com/fatedier/frp). frp is a general tunnelling tool that is often abused, so Windows Defender and other antivirus products label it "hack tool / riskware" and quarantine it; some cloud providers' host security agents also raise alerts for `frps` on the server. This project uses frp's official release files, verifies their SHA256 when packaging, runs them only while connected and connects only to your own server.
-- **What to do.** Add the client's installation folder (at least `resources\vendor` inside it) to your antivirus exclusions; if a file was already quarantined, restore it or reinstall. A message about a component failing to start when you connect is usually this.
+- **Verify before allowing.** Do not assume an alert is a false positive just because it names frp. Check that the installer comes from this repository's [releases page](https://github.com/sun168567/cc-desk-tunnel/releases/latest), verify it against `SHA256SUMS`, and identify the file that was blocked. If you still choose to use it after checking the source, make only the necessary exception for the verified component file; do not disable antivirus or exclude a whole drive. Restore quarantined files or reinstall only after verification. Check protection history first when a component fails to start.
 - **SmartScreen.** The installer is not code-signed. On first run Windows shows "Windows protected your PC": choose "More info → Run anyway".
 - The project never changes the settings of any security software. If in doubt, build from source.
 
@@ -172,6 +174,10 @@ deploy/             Docker deployment and operations scripts
 scripts/            Checks, development launcher, packaging, release
 docs/               Architecture, deployment and development documentation
 ```
+
+## Community
+
+We recognize [LINUX DO](https://linux.do/) and its values of sincerity, friendliness, solidarity and professionalism, and appreciate the community's discussions of remote development and open-source tools. Feedback is welcome; redact account details, service tokens, server addresses and private project information first. Report security vulnerabilities through the [private reporting channel](SECURITY.md#报告漏洞).
 
 ## License
 
