@@ -5,6 +5,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required.' }
+# The parent reads stdout as UTF-8, including executable paths in the connection JSON.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = Get-Acl -LiteralPath $Runtime
 $acl.SetAccessRuleProtection($true, $false)

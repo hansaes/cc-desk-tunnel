@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFile, spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { connect, createServer } from 'node:net';
@@ -26,28 +26,40 @@ function execute(file, args) {
     ),
   );
 }
-async function prepare() {
+async function prepare(powershell = 'pwsh.exe', legacyEncoding = false) {
   const directory = await mkdtemp(join(tmpdir(), 'cc-desk-tunnel-ssh-'));
   const server = createServer();
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   await new Promise((resolve) => server.close(resolve));
   try {
-    const metadata = JSON.parse(
-      await execute('pwsh.exe', [
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-File',
-        resolve('apps/desktop/electron/prepare-ssh.ps1'),
-        '-Runtime',
-        directory,
-        '-OpenSshDirectory',
-        join(vendor, 'openssh'),
-        '-Port',
-        String(port),
-      ]),
-    );
+    const scriptPath = resolve('apps/desktop/electron/prepare-ssh.ps1');
+    const quote = (value) => `'${value.replaceAll("'", "''")}'`;
+    const args = legacyEncoding
+      ? [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-EncodedCommand',
+          Buffer.from(
+            `[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(936); & ${quote(scriptPath)} -Runtime ${quote(directory)} -OpenSshDirectory ${quote(join(vendor, 'openssh'))} -Port ${port}`,
+            'utf16le',
+          ).toString('base64'),
+        ]
+      : [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-File',
+          scriptPath,
+          '-Runtime',
+          directory,
+          '-OpenSshDirectory',
+          join(vendor, 'openssh'),
+          '-Port',
+          String(port),
+        ];
+    const metadata = JSON.parse(await execute(powershell, args));
     const config = await readFile(join(directory, 'sshd_config'), 'utf8');
     assert.match(config, /ListenAddress 127\.0\.0\.1/);
     assert.match(config, /PasswordAuthentication no/);
@@ -97,6 +109,35 @@ function hostArgs(directory, owner = process.pid) {
     String(owner),
   ];
 }
+
+test(
+  'SSH preparation emits UTF-8 metadata for a bundled PowerShell path with Chinese and spaces',
+  {
+    skip:
+      !available ||
+      !(await access(join(vendor, 'pwsh/pwsh.exe')).then(
+        () => true,
+        () => false,
+      )),
+    timeout: 30000,
+  },
+  async () => {
+    const fixture = await mkdtemp(join(tmpdir(), 'cc-desk-tunnel-test-'));
+    const alias = join(fixture, '\u5b89\u88c5 \u8def\u5f84');
+    let directory;
+    try {
+      await symlink(join(vendor, 'pwsh'), alias, 'junction');
+      const powershell = join(alias, 'pwsh.exe');
+      const prepared = await prepare(powershell, true);
+      directory = prepared.directory;
+      assert.equal(prepared.metadata.powershellPath, powershell);
+      assert.doesNotMatch(prepared.metadata.powershellPath, /\uFFFD/);
+    } finally {
+      if (directory) await rm(directory, { recursive: true, force: true });
+      await rm(fixture, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   'application-owned OpenSSH closes its loopback listener and removes keys on client shutdown',
