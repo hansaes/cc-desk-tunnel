@@ -1,0 +1,28 @@
+# 与 docs/development.md 里“开合并请求前”的命令一致。
+# 桌面客户端需要 Windows 与打包组件的用例在 Linux 上自动跳过（component-host 等）。
+name: 检查
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm test
