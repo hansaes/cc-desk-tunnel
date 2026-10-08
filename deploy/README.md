@@ -10,7 +10,7 @@ Ubuntu amd64 优先。官方 Claude Code、Agent SDK、frps、PTY 同容器；�
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install.sh)"
 ```
 
-目前不提供现成镜像：镜像在你的服务器上从程序包构建，首次需要几分钟，期间联网下载系统包、Node.js、Claude Code、frps 和 npm 依赖。
+镜像默认在你的服务器上从程序包构建，首次需要几分钟，期间联网下载系统包、Node.js、Claude Code、frps 和 npm 依赖；本仓库的 Actions 也会构建好镜像发布到 GHCR，可以直接拉取，见[预构建镜像](#预构建镜像ghcr)。
 
 也可以手动准备：从项目的 GitHub 发布页取同一版本的三个文件：服务端程序包 `cc-desk-tunnel-server-X.Y.Z.tar.gz`、Windows 安装包 `CC-Desk-Tunnel-Setup-X.Y.Z-x64.exe` 和 `SHA256SUMS`。放到 VPS 的同一目录后先校验，再把程序包解压到专用程序目录：
 
@@ -77,6 +77,20 @@ sudo bash deploy/manage.sh connection
 默认两个公网 TCP 端口：WSS / HTTPS `8787`、强制 TLS frp `7000`。运维 SSH 遵循服务器已有端口。云防火墙与主机策略自行放行，**不需要 UDP 或公开 Windows / Linux 随机 SSH 映射端口**。Docker 发布端口可能绕过 UFW 的常规 INPUT 规则，应采用云安全组或 Docker 对应防火墙策略，不把启用 UFW 当成已限制发布端口。
 
 部分云厂商的主机安全组件会对容器里的 `frps` 告警；它是 frp 官方发布的原版文件（构建镜像时校验 SHA256），只在有客户端连接时运行。nginx 模式下服务按 `X-Real-IP` 区分来源地址做登录限速，请保留示例里的这一行。
+
+## 预构建镜像（GHCR）
+
+仓库的 GitHub Actions 在推送到 `main`、打 `v<版本>` 标签或手动触发时构建服务端镜像，推送到 GitHub 容器镜像仓库。镜像是公开的，不需要登录：
+
+```sh
+docker pull ghcr.io/hansaes/cc-desk-tunnel:latest   # 跟随 main
+docker pull ghcr.io/hansaes/cc-desk-tunnel:main
+docker pull ghcr.io/hansaes/cc-desk-tunnel:0.2.5    # 版本标签，与源码版本号一致
+```
+
+镜像内容与在服务器上构建 `deploy/docker/Dockerfile` 的结果一致，只是省去首次构建的等待。部署步骤与只导入镜像时相同：先初始化数据目录（`install.sh init` / `manage.sh init`），再按“运维”一节用 `deploy/compose.yml`（无 build）管理，把 `PROXY_IMAGE` 设为上面的某个标签；升级时拉取新标签后 `docker compose up -d`，不用 `manage.sh build`。
+
+只构建 `linux/amd64`：`scripts/install-linux.sh` 里的 frps 目前只验证了 x64。镜像里的程序版本要与客户端一致，不匹配时两端一起升级。
 
 ## 三种 TLS 入口
 

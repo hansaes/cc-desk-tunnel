@@ -15,6 +15,8 @@ Claude Code (CC for short) runs on a Linux server; your code, compilers and tool
 >
 > The client interface, the installer prompts and the detailed documentation are currently in Chinese only.
 
+> Repository note: a copy of [sun168567/cc-desk-tunnel](https://github.com/sun168567/cc-desk-tunnel) that additionally builds the server Docker image on GitHub Actions and publishes it to GHCR. Releases, installers and server archives still come from upstream.
+
 ## What it solves
 
 | The usual way | What gets in the way | With CC Desk Tunnel |
@@ -77,7 +79,7 @@ The script:
 3. Asks for the public address, certificate mode, ports and data directory (every question has a default), then builds the image and starts it.
 4. Prints what the client needs — **service address, certificate fingerprint, service token** — and the two TCP ports to open in the firewall (8787 and 7000 by default).
 
-There is no prebuilt image yet: the image is built from source on your server, which takes a few minutes the first time. The script does not touch the firewall, nginx or SSH. Running the same command again upgrades an existing deployment. Manual installation, the three certificate modes, backup and restore are covered in the [deployment manual](deploy/README.md); if you already run nginx with a domain, see [reverse proxying with nginx](deploy/nginx.md).
+By default the image is built from source on your server, which takes a few minutes the first time. This repository's Actions also build it and publish it to GHCR, so you can pull it instead; see [prebuilt images](deploy/README.md#预构建镜像ghcr). The script does not touch the firewall, nginx or SSH. Running the same command again upgrades an existing deployment. Manual installation, the three certificate modes, backup and restore are covered in the [deployment manual](deploy/README.md); if you already run nginx with a domain, see [reverse proxying with nginx](deploy/nginx.md).
 
 ### 2. Install the Windows client
 

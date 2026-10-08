@@ -13,6 +13,8 @@ Claude Code（简称 CC）运行在一台 Linux 服务器上；项目代码、�
 >
 > 本项目与 Anthropic 没有隶属或合作关系。“Claude”“Claude Code”是 Anthropic 的商标。
 
+> 仓库说明：这是 [sun168567/cc-desk-tunnel](https://github.com/sun168567/cc-desk-tunnel) 的副本，额外用 GitHub Actions 构建服务端 Docker 镜像并发布到 GHCR；发布页、安装包与服务端程序包仍来自上游。
+
 ## 解决什么问题
 
 | 常见做法 | 麻烦在哪 | 用 CC Desk Tunnel |
@@ -64,7 +66,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 3. 询问公网地址、证书方式、端口和数据目录（都有默认值，一路回车即可），然后构建镜像并启动。
 4. 打印客户端要填的**服务地址、证书指纹、服务凭据**，以及需要在防火墙放行的两个 TCP 端口（默认 8787 和 7000）。
 
-目前不提供现成镜像，镜像在你的服务器上从源码构建，首次需要几分钟。脚本不会修改防火墙、nginx 或 SSH 配置。再次运行同一条命令可以升级已有部署。手动安装、三种证书方式、备份恢复等见[部署操作手册](deploy/README.md)；已有 nginx 和域名时见[用 nginx 反代](deploy/nginx.md)。
+镜像默认在你的服务器上从源码构建，首次需要几分钟；本仓库的 Actions 也会构建镜像并发布到 GHCR，可以直接拉取，见[预构建镜像](deploy/README.md#预构建镜像ghcr)。脚本不会修改防火墙、nginx 或 SSH 配置。再次运行同一条命令可以升级已有部署。手动安装、三种证书方式、备份恢复等见[部署操作手册](deploy/README.md)；已有 nginx 和域名时见[用 nginx 反代](deploy/nginx.md)。
 
 ### 2. 安装 Windows 客户端
 
