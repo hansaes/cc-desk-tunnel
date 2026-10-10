@@ -1,28 +1,25 @@
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connect, createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
-import { httpProxy } from './system-proxy.mjs';
+import { componentFailure, missingComponent } from './connect-errors.mjs';
 
-function execute(file, args) {
+function execute(file, args, timeout) {
   return new Promise((resolve, reject) => {
-    execFile(
-      file,
-      args,
-      { windowsHide: true, encoding: 'utf8', timeout: 30000 },
-      (error, stdout) => {
-        if (error)
-          reject(
-            new Error(
-              'Windows SSH preparation failed. Check bundled OpenSSH, PowerShell 7 and directory permissions.',
-            ),
-          );
-        else resolve(stdout);
-      },
-    );
+    execFile(file, args, { windowsHide: true, encoding: 'utf8', timeout }, (error, stdout) => {
+      if (error)
+        reject(
+          new Error(
+            error.code === 'ENOENT'
+              ? missingComponent('PowerShell（pwsh.exe）')
+              : '本机 SSH 服务的准备步骤失败。\n内置的 PowerShell 或 OpenSSH 可能被安全软件拦截，或临时目录不可写；请检查安全软件的保护记录后重新连接，仍然失败时重新安装本应用。',
+          ),
+        );
+      else resolve(stdout);
+    });
   });
 }
 async function waitForHost(child) {
@@ -70,7 +67,9 @@ function probe(port) {
     });
   });
 }
-export async function startWindowsTunnel(configuration, binaries, signal, onFailure) {
+// Starts the SSH service of this connection: the bundled OpenSSH on a loopback port, with a host key and a
+// login key made for this connection alone. `readyMs` is how long it may take to start listening.
+export async function startWindowsSsh(connectionId, binaries, signal, onFailure, readyMs = 10000) {
   if (process.platform !== 'win32') throw new Error('Windows OpenSSH requires Windows.');
   const directory = await mkdtemp(join(tmpdir(), 'cc-desk-tunnel-ssh-'));
   const powershell = binaries.powershell ?? 'pwsh.exe';
@@ -96,67 +95,47 @@ export async function startWindowsTunnel(configuration, binaries, signal, onFail
   };
   function launch(file, args) {
     check();
-    const child = spawn(file, args, { windowsHide: true, stdio: 'ignore' });
+    // The host and its components print why they stop; the end of that is kept to explain a failure.
+    const child = spawn(file, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const started = Date.now();
+    let output = '';
+    for (const stream of [child.stdout, child.stderr])
+      stream.on('data', (chunk) => {
+        output = (output + chunk.toString('utf8')).slice(-8192);
+      });
     children.push(child);
     child.once('error', () => {
-      if (!closed) onFailure('组件启动失败，请检查安装与杀毒软件状态。');
+      if (!closed) onFailure(missingComponent('PowerShell（pwsh.exe）'));
     });
     child.once('close', () => {
-      if (!closed) onFailure('Windows 隧道组件已退出，请重新连接。');
+      if (!closed) onFailure(componentFailure(output, Date.now() - started < 30000));
     });
     return child;
   }
   try {
     check();
+    await access(join(binaries.openssh, 'sshd.exe')).catch(() => {
+      throw new Error(missingComponent('sshd.exe'));
+    });
     const port = await availablePort();
     const metadata = JSON.parse(
-      await execute(powershell, [
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-File',
-        scriptPath('prepare-ssh.ps1'),
-        '-Runtime',
-        directory,
-        '-OpenSshDirectory',
-        binaries.openssh,
-        '-Port',
-        String(port),
-      ]),
-    );
-    const proxy = httpProxy(
-      await binaries.resolveProxy?.(
-        `https://${configuration.serverAddr}:${configuration.serverPort}`,
-      ),
-    );
-    check();
-    const caPath = join(directory, 'server.crt');
-    await writeFile(caPath, configuration.certificate, 'utf8');
-    const configPath = join(directory, 'frpc.json');
-    await writeFile(
-      configPath,
-      JSON.stringify({
-        serverAddr: configuration.serverAddr,
-        serverPort: configuration.serverPort,
-        loginFailExit: true,
-        auth: { method: 'token', token: configuration.token },
-        transport: {
-          // The execution channel takes the same system proxy as the control connection.
-          ...(proxy && { proxyURL: `http://${proxy.host}:${proxy.port}` }),
-          tls: { enable: true, trustedCaFile: caPath, serverName: configuration.serverName },
-        },
-        proxies: [
-          {
-            name: configuration.connectionId,
-            type: 'tcp',
-            localIP: '127.0.0.1',
-            localPort: port,
-            remotePort: configuration.remotePort,
-          },
+      await execute(
+        powershell,
+        [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-File',
+          scriptPath('prepare-ssh.ps1'),
+          '-Runtime',
+          directory,
+          '-OpenSshDirectory',
+          binaries.openssh,
+          '-Port',
+          String(port),
         ],
-        log: { to: 'console', level: 'error', disablePrintColor: true },
-      }),
-      'utf8',
+        Math.max(30000, readyMs),
+      ),
     );
     check();
     launch(powershell, [
@@ -171,11 +150,9 @@ export async function startWindowsTunnel(configuration, binaries, signal, onFail
       binaries.openssh,
       '-OwnerProcessId',
       String(process.pid),
-      '-FrpcPath',
-      binaries.frpc,
     ]);
     let ready = false;
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (const started = Date.now(); Date.now() - started < readyMs;) {
       check();
       if (await probe(port)) {
         ready = true;
@@ -183,11 +160,15 @@ export async function startWindowsTunnel(configuration, binaries, signal, onFail
       }
       await delay(100);
     }
-    if (!ready) throw new Error('Windows OpenSSH startup timed out');
+    if (!ready)
+      throw new Error(
+        `本机的 SSH 服务在 ${readyMs / 1000} 秒内没有就绪。\n请重新连接；反复出现时检查安全软件是否拦截了内置的 sshd.exe。这台电脑启动较慢时，可在“设置 → 常规”里调大等待时间。`,
+      );
     return {
+      port,
       credentials: {
         type: 'tunnel.credentials',
-        connectionId: configuration.connectionId,
+        connectionId,
         username: metadata.username,
         powershellPath: metadata.powershellPath,
         privateKey: metadata.privateKey,

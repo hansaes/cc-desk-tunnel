@@ -18,6 +18,14 @@ test('Claude Code settings load from the service and save each change at once', 
     fileCheckpointingEnabled: null,
     promptCacheTtl: null,
     language: null,
+    precomputeCompactionEnabled: null,
+    autoDreamEnabled: null,
+    subagentPromptCacheTtl: null,
+    fallbackModel: null,
+    askUserQuestionTimeout: null,
+    bashOutputMaxChars: 45_000,
+    attribution: null,
+    includeGitInstructions: null,
   };
   const updates: unknown[] = [];
   await page.routeWebSocket('ws://127.0.0.1:18889/ws', (route) => {
@@ -50,8 +58,8 @@ test('Claude Code settings load from the service and save each change at once', 
     .getByLabel('服务凭据', { exact: true })
     .fill('test-only-settings-token-with-enough-length');
   await page.getByRole('button', { name: '连接', exact: true }).click();
-  await page.locator('.sidebar-footer').click();
-  await page.getByRole('menuitem', { name: 'Claude Code 设置', exact: true }).click();
+  await page.getByRole('button', { name: '设置与账号', exact: true }).click();
+  await page.getByRole('menuitem', { name: '设置', exact: true }).click();
   const panel = page.getByRole('region', { name: 'Claude Code 设置' });
   await expect(panel.getByLabel('自动压缩窗口', { exact: true })).toHaveValue('250000');
   await expect(panel.getByLabel('快速模式', { exact: true })).toHaveValue('false');
@@ -60,6 +68,15 @@ test('Claude Code settings load from the service and save each change at once', 
   await panel.getByLabel('快速模式', { exact: true }).selectOption('');
   await panel.getByLabel('回复语言', { exact: true }).fill('chinese');
   await panel.getByLabel('回复语言', { exact: true }).press('Enter');
+  // A value set by hand that is not among the choices is still shown.
+  await expect(panel.getByLabel('命令输出上限', { exact: true })).toHaveValue('45000');
+  await panel.getByLabel('提交与 PR 的署名', { exact: true }).selectOption('false');
+  await panel.getByLabel('备用模型', { exact: true }).fill('sonnet， haiku');
+  await panel.getByLabel('备用模型', { exact: true }).press('Enter');
+  await expect(panel.getByLabel('备用模型', { exact: true })).toHaveValue('sonnet, haiku');
+  await panel.getByLabel('提问无人回答时', { exact: true }).selectOption('5m');
+  await panel.getByLabel('备用模型', { exact: true }).fill('');
+  await panel.getByLabel('备用模型', { exact: true }).press('Enter');
   await expect
     .poll(() => updates)
     .toEqual([
@@ -67,7 +84,27 @@ test('Claude Code settings load from the service and save each change at once', 
       { autoContinueAtUsageLimit: true },
       { fastMode: null },
       { language: 'chinese' },
+      { attribution: false },
+      { fallbackModel: ['sonnet', 'haiku'] },
+      { askUserQuestionTimeout: '5m' },
+      { fallbackModel: null },
     ]);
   await expect(panel.getByLabel('自动压缩窗口', { exact: true })).toHaveValue('1000000');
   await page.screenshot({ path: resolve('.local/screenshots/settings.png') });
+});
+
+test('the settings of this computer open from the login page without a connection', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '本机设置', exact: true }).click();
+  await expect(page.getByRole('navigation', { name: '设置分类' }).getByRole('button')).toHaveText([
+    '常规',
+    '通知',
+    '快捷键',
+  ]);
+  await page.getByRole('button', { name: '通知', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '通知', level: 1 })).toBeVisible();
+  await page.getByRole('button', { name: '返回登录', exact: true }).click();
+  await expect(page.getByLabel('服务地址')).toBeVisible();
 });

@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import {
   UserRound,
   RefreshCw,
-  X,
   Activity,
   ShieldCheck,
   LogIn,
@@ -21,6 +20,7 @@ import type {
 import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
 import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
+import { copyText } from './copy.tsx';
 
 export default function AccountPanel({
   client,
@@ -31,7 +31,6 @@ export default function AccountPanel({
   disabled,
   error,
   refresh,
-  close,
 }: {
   client: ProxyClient;
   account: AccountState | null;
@@ -41,7 +40,6 @@ export default function AccountPanel({
   disabled: boolean;
   error: string | null;
   refresh: () => void;
-  close: () => void;
 }) {
   const account = capabilities?.account;
   const [working, setWorking] = useState(false);
@@ -86,9 +84,6 @@ export default function AccountPanel({
         </h1>
         <IconButton title="刷新账号信息" disabled={disabled} onClick={refresh}>
           <RefreshCw className={refreshing ? 'spinning' : ''} />
-        </IconButton>
-        <IconButton title="关闭账号信息" onClick={close}>
-          <X />
         </IconButton>
       </header>
       <div className="account-body">
@@ -194,10 +189,13 @@ export default function AccountPanel({
                 type="button"
                 className="button secondary"
                 onClick={() => {
-                  void navigator.clipboard.writeText(state.login!.url).then(() => {
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 2000);
-                  });
+                  void copyText(state.login!.url).then(
+                    () => {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    },
+                    () => setFailure('复制失败，请重试。'),
+                  );
                 }}
               >
                 {copied ? <Check /> : <Copy />}

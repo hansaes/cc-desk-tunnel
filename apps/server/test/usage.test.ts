@@ -121,6 +121,28 @@ test('filters, buckets in the viewer time zone, and retention limits', () => {
   assert.equal(haiku.totals.requests, 1);
   assert.equal(haiku.totals.outputPerSecond, null);
   assert.deepEqual(haiku.models, daily.models);
+  // The breakdown by model covers the range whatever the filter; each bucket splits its tokens by kind.
+  assert.deepEqual(daily.byModel.map((item) => [item.model, item.requests]).sort(), [
+    ['claude-haiku-4-5', 1],
+    ['claude-opus-5-5', 2],
+  ]);
+  assert.deepEqual(haiku.byModel, daily.byModel);
+  const [day] = daily.series;
+  assert.equal(
+    day.inputTokens + day.outputTokens + day.cacheReadTokens + day.cacheCreationTokens,
+    day.tokens,
+  );
+  assert.ok(day.cacheReadTokens > 0);
+  // Pages are counted from the newest record.
+  const first = log.query({ ...range, bucketMinutes: 60, limit: 2 }, () => null);
+  const second = log.query({ ...range, bucketMinutes: 60, limit: 2, offset: 2 }, () => null);
+  assert.equal(first.hasMore, true);
+  assert.equal(second.hasMore, false);
+  assert.deepEqual(
+    [...first.rows, ...second.rows].map((row) => row.id),
+    daily.rows.map((row) => row.id),
+  );
+  assert.equal(second.totals.requests, 3);
   log.prune(base + 3 * hour);
   assert.equal(
     log.query({ limit: 100, bucketMinutes: 60, offsetMinutes: 0 }, () => null).totals.requests,
@@ -175,6 +197,123 @@ test('period statistics follow the official windows, including early resets and 
   log.ingest(batch(request(base + 8 * hour, 'w4')));
   log.observe(limits([10, base + 12 * hour], [0, weekEnd]), base + 8 * hour + 1);
   assert.deepEqual(count(base + 8 * hour + 2), { five_hour: 2, seven_day: 1 });
+});
+
+test('a period survives jitter and repeated readings, and a cut-short one is restored', () => {
+  const database = new DatabaseSync(':memory:');
+  const log = new UsageLog(database);
+  const weekEnd = base + 3 * 24 * hour;
+  const weekStart = new Date(weekEnd - 7 * 24 * hour).toISOString();
+  const reading = (utilization: number, at: number, resetsAt: number | null = weekEnd) => ({
+    measuredAt: new Date(at).toISOString(),
+    windows: [
+      {
+        name: 'seven_day',
+        utilization,
+        resetsAt: resetsAt === null ? null : new Date(resetsAt).toISOString(),
+      },
+    ],
+  });
+  const started = () => log.summary(base + 3 * hour).windows[0].startedAt;
+  log.ingest(batch(request(base, 'j1')));
+  log.observe(reading(45, base + hour));
+  // Two readings a few milliseconds apart, the later one a point lower.
+  log.observe(reading(44, base + hour + 36));
+  assert.equal(started(), weekStart);
+  // Another session's long turn emits the reading it took earlier once more.
+  log.observe(reading(47, base + 2 * hour));
+  log.observe(reading(30, base + hour + 10), base + 2 * hour + 5);
+  assert.equal(started(), weekStart);
+  assert.equal(log.summary(base + 3 * hour).windows[0].utilization, 47);
+  assert.equal(log.summary(base + 3 * hour).windows[0].requests, 1);
+  // A reset granted early leaves the reset time alone, and something has been used again by the next reading.
+  log.observe(reading(3, base + 2 * hour + 100));
+  assert.equal(started(), new Date(base + 2 * hour).toISOString());
+  assert.equal(log.summary(base + 3 * hour).windows[0].requests, 0);
+
+  // An expired window is reported empty and without a reset time; its next period is told by the new one.
+  const five = (utilization: number, at: number, resetsAt: number | null) => ({
+    measuredAt: new Date(at).toISOString(),
+    windows: [
+      {
+        name: 'five_hour',
+        utilization,
+        resetsAt: resetsAt === null ? null : new Date(resetsAt).toISOString(),
+      },
+    ],
+  });
+  const fiveStart = () =>
+    log.summary(base + 9 * hour).windows.find((window) => window.name === 'five_hour')!.startedAt;
+  log.observe(five(2, base + hour, base + 5 * hour));
+  log.observe(five(0, base + 6 * hour, null));
+  log.observe(five(1, base + 7 * hour, base + 11.5 * hour));
+  assert.equal(fiveStart(), new Date(base + 6.5 * hour).toISOString());
+
+  // A database written before the fix: the start is put back once, and the records stay.
+  const old = new DatabaseSync(':memory:');
+  new UsageLog(old).ingest(batch(request(Date.now() - hour, 'kept')));
+  const resetsAt = Date.now() + 2 * 24 * hour;
+  old.exec("DELETE FROM migrations WHERE name = 'usage-window-start'");
+  old
+    .prepare('INSERT INTO usage_windows VALUES (?, ?, ?, ?, ?)')
+    .run('seven_day', Date.now() - 60_000, resetsAt, 51, Date.now() - 1000);
+  const records = old.prepare('SELECT * FROM api_requests ORDER BY id').all();
+  const restored = new UsageLog(old).summary().windows[0];
+  assert.equal(restored.startedAt, new Date(resetsAt - 7 * 24 * hour).toISOString());
+  assert.equal(restored.requests, 1);
+  assert.deepEqual(old.prepare('SELECT * FROM api_requests ORDER BY id').all(), records);
+  // Recovery is once only; a later explicitly observed reset must survive a restart.
+  old.prepare('UPDATE usage_windows SET started_at = ?').run(Date.now() - 500);
+  new UsageLog(old);
+  assert.ok(
+    Number(old.prepare('SELECT started_at FROM usage_windows').get()!.started_at) >
+      Date.now() - 5000,
+  );
+});
+
+test('period recovery preserves an early reset recorded in the original quota events', () => {
+  const db = new DatabaseSync(':memory:');
+  const log = new UsageLog(db);
+  const now = Date.now();
+  const end = now + 2 * 24 * hour;
+  log.ingest(batch(request(now - 4 * hour, 'before-reset'), request(now - hour, 'after-reset')));
+  db.exec(
+    "DELETE FROM migrations WHERE name = 'usage-window-start'; CREATE TABLE events (data TEXT NOT NULL)",
+  );
+  db.prepare('INSERT INTO usage_windows VALUES (?, ?, ?, ?, ?)').run(
+    'seven_day',
+    now - 60000,
+    end,
+    20,
+    now,
+  );
+  const insert = db.prepare('INSERT INTO events VALUES (?)');
+  for (const [at, utilization] of [
+    [now - 3 * hour, 60],
+    [now - 2 * hour, 2],
+    [now - hour, 20],
+  ]) {
+    insert.run(
+      JSON.stringify({
+        createdAt: new Date(at).toISOString(),
+        payload: {
+          type: 'native.metrics',
+          rateLimits: {
+            available: true,
+            measuredAt: new Date(at).toISOString(),
+            windows: [{ name: 'seven_day', resetsAt: new Date(end).toISOString(), utilization }],
+          },
+        },
+      }),
+    );
+  }
+  const records = db.prepare('SELECT * FROM api_requests ORDER BY id').all();
+  const events = db.prepare('SELECT * FROM events').all();
+  const recovered = new UsageLog(db).summary().windows[0];
+  assert.equal(recovered.requests, 1);
+  assert.equal(recovered.startedAt, new Date(now - 3 * hour).toISOString());
+  assert.deepEqual(db.prepare('SELECT * FROM api_requests ORDER BY id').all(), records);
+  assert.deepEqual(db.prepare('SELECT * FROM events').all(), events);
 });
 
 test('loopback receiver accepts OTLP JSON log exports', async () => {

@@ -1,5 +1,7 @@
 import { builtinModules } from 'node:module';
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import files from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -13,7 +15,7 @@ const output = join(root, 'artifacts/windows');
 const unpacked = process.argv.includes('--dir');
 if (process.platform !== 'win32' || process.arch !== 'x64')
   throw new Error('Build the Windows x64 package on Windows x64.');
-for (const file of ['frpc.exe', 'openssh/sshd.exe', 'openssh/ssh-keygen.exe', 'pwsh/pwsh.exe']) {
+for (const file of ['openssh/sshd.exe', 'openssh/ssh-keygen.exe', 'pwsh/pwsh.exe']) {
   if (!existsSync(join(vendor, file)))
     throw new Error(`Missing bundled component: ${file}. Run npm run prepare:windows:package.`);
 }
@@ -43,8 +45,12 @@ await viteBuild({
     },
   },
 });
-// The bridge and its tunnel module are already in the bundle above; the rest of the main process ships as written.
-for (const file of ['main.cjs', 'preload.cjs', 'icon.png', 'prepare-ssh.ps1', 'component-host.ps1'])
+// All CommonJS modules ship as written, including helpers required by main/preload.
+// The ESM bridge and its dependencies are already in the bundle above.
+const commonjs = readdirSync(join(root, 'apps/desktop/electron')).filter((file) =>
+  file.endsWith('.cjs'),
+);
+for (const file of [...commonjs, 'icon.png', 'prepare-ssh.ps1', 'component-host.ps1'])
   cpSync(join(root, 'apps/desktop/electron', file), join(app, 'electron', file));
 // The staging manifest has no dependencies: the Node bridge and protocol are bundled.
 writeFileSync(
@@ -66,6 +72,21 @@ writeFileSync(
   ) + '\n',
 );
 const electron = JSON.parse(readFileSync(join(root, 'node_modules/electron/package.json'), 'utf8'));
+// Security software may hold an executable for some seconds after it is copied, while it scans it; electron-builder
+// writes the executable's resources right after copying it and fails. Its writes wait for the file instead.
+const writeFile = files.writeFile;
+files.writeFile = async (...args) => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await writeFile(...args);
+    } catch (error) {
+      if (attempt === 30 || !['UNKNOWN', 'EBUSY', 'EPERM', 'EACCES'].includes(error.code))
+        throw error;
+      if (attempt === 1) console.log(`Waiting for ${args[0]}, which another program holds.`);
+      await delay(2000);
+    }
+  }
+};
 const results = await electronBuild({
   targets: Platform.WINDOWS.createTarget(unpacked ? 'dir' : 'nsis', Arch.x64),
   publish: 'never',
@@ -83,7 +104,7 @@ const results = await electronBuild({
       {
         from: vendor,
         to: 'vendor',
-        filter: ['frpc.exe', 'frp-LICENSE', 'openssh/**', 'pwsh/**', '!**/runtime.json'],
+        filter: ['openssh/**', 'pwsh/**', '!**/runtime.json'],
       },
     ],
     win: {
@@ -105,6 +126,22 @@ const results = await electronBuild({
     },
   },
 });
+// Exercise the actual packaged main process and preload before a release can upload this installer.
+// Always use an isolated profile and stay offline, even if the caller configured native testing.
+execFileSync(
+  process.execPath,
+  [join(root, 'node_modules/@playwright/test/cli.js'), 'test', 'package.spec.ts'],
+  {
+    cwd: root,
+    windowsHide: true,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      WINDOWS_PACKAGE_EXE: join(output, 'win-unpacked/CC Desk Tunnel.exe'),
+      NATIVE_TEST_CONFIG: '',
+    },
+  },
+);
 execFileSync(
   'pwsh.exe',
   [

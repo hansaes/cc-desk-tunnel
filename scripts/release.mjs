@@ -5,10 +5,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Builds the release files for the version in apps/desktop/package.json and uploads them to a GitHub release.
-// The release stays a draft unless --publish is given; --dry-run only builds. Needs gh (or GH pointing at it) and GH_TOKEN.
+// The release stays a draft unless --publish is given; --prerelease selects the preview channel.
+// --dry-run only builds. Needs gh (or GH pointing at it) and GH_TOKEN.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dryRun = process.argv.includes('--dry-run');
 const publish = process.argv.includes('--publish');
+const prerelease = process.argv.includes('--prerelease');
 const gh = process.env.GH ?? 'gh';
 const run = (file, args, options = {}) =>
   execFileSync(file, args, { cwd: root, encoding: 'utf8', windowsHide: true, ...options });
@@ -23,13 +25,36 @@ const protocol = Number(
 // Raised whenever the image must be rebuilt for a release to run; see deploy/docker/runtime-level.
 const runtime = Number(readFileSync(join(root, 'deploy/docker/runtime-level'), 'utf8'));
 const tag = `v${version}`;
-const notes = new RegExp(
+const section = new RegExp(
   `^## ${version.replaceAll('.', '\\.')}\\s*\\n([\\s\\S]*?)(?=^## |$(?![\\s\\S]))`,
   'm',
 )
   .exec(readFileSync(join(root, 'CHANGELOG.md'), 'utf8'))?.[1]
   .trim();
-if (!notes) throw new Error(`CHANGELOG.md has no section "## ${version}".`);
+if (!section) throw new Error(`CHANGELOG.md has no section "## ${version}".`);
+const repository = 'https://github.com/sun168567/cc-desk-tunnel';
+// Every release reads the same way: what the project is, this version's section of the change log with its
+// headings one level up, then how to get and upgrade to it.
+const notes = [
+  '> 用桌面客户端驱动云端的 Claude Code，经反向隧道在你的 Windows 本机执行。',
+  '',
+  section.replace(/^### /gm, '## '),
+  '',
+  '---',
+  '',
+  '## 下载与升级',
+  '',
+  prerelease
+    ? '- **预发布版本**：不会通过稳定版的自动更新提供。请手动下载本页的服务端程序包与 Windows 安装包，两端一起升级；部署脚本的 latest 下载入口仍指向稳定版。'
+    : `- **已在使用**：在客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；两端需要同一版本。`,
+  `- **Windows 客户端**：下载 \`CC-Desk-Tunnel-Setup-${version}-x64.exe\` 并安装。安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}#杀毒软件与-smartscreen)。`,
+  prerelease
+    ? `- **服务端**：下载本页的 \`cc-desk-tunnel-server-${version}.tar.gz\`，按[部署手册](${repository}/blob/main/deploy/README.md)的手动准备步骤校验、解压并运行安装脚本。`
+    : `- **服务端**：新部署按[快速开始](${repository}#快速开始)用一条命令安装；\`cc-desk-tunnel-server-${version}.tar.gz\` 是它下载的程序包。`,
+  '- **校验**：各文件的 SHA256 在 `SHA256SUMS` 与 `release.json` 中。',
+  '',
+  `文档：[部署手册](${repository}/blob/main/deploy/README.md) · [变更记录](${repository}/blob/main/CHANGELOG.md) · [安全须知](${repository}#安全须知)`,
+].join('\n');
 
 // A release is cut from exactly what the main branch on GitHub holds, so the tag matches the files.
 const commit = git('rev-parse', 'HEAD');
@@ -92,6 +117,7 @@ if (dryRun) {
     'create',
     tag,
     ...(publish ? [] : ['--draft']),
+    ...(prerelease ? ['--prerelease', '--latest=false'] : []),
     '--target',
     commit,
     '--title',

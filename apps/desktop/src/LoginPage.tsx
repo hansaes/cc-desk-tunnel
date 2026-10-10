@@ -1,4 +1,4 @@
-import { Download, SquareTerminal, Unplug } from 'lucide-react';
+import { Download, Settings, SquareTerminal, Unplug } from 'lucide-react';
 import { GithubMark, openProject, project } from './project.tsx';
 
 export type ConnectionForm = {
@@ -19,6 +19,7 @@ export default function LoginPage({
   upgrade,
   install,
   submit,
+  openSettings,
 }: {
   form: ConnectionForm;
   change: (values: Partial<ConnectionForm>) => void;
@@ -28,9 +29,12 @@ export default function LoginPage({
   upgrade: string | null;
   install: () => void;
   submit: () => void;
+  // This computer's own settings, which need no connection.
+  openSettings: () => void;
 }) {
   return (
     <main className="login-page">
+      <div className="window-drag" />
       <div className="login-content">
         <div className="brand">
           <SquareTerminal />
@@ -38,9 +42,7 @@ export default function LoginPage({
         </div>
         <div className="login-title">
           <h1>连接代理服务</h1>
-          <span className="badge simulation">
-            {form.mode === 'remote' ? '原生 SSH' : '离线模拟'}
-          </span>
+          {form.mode === 'local' && <span className="badge simulation">离线模拟</span>}
         </div>
         <form
           onSubmit={(event) => {
@@ -49,7 +51,7 @@ export default function LoginPage({
           }}
           className="connection-form"
         >
-          {window.desktop && (
+          {window.desktop?.dev && (
             <div className="connection-modes" role="group" aria-label="连接方式">
               <button
                 type="button"
@@ -151,12 +153,18 @@ export default function LoginPage({
             {connecting ? '连接中…' : '连接'}
           </button>
         </form>
-        {project.url && (
-          <button className="project-link" type="button" onClick={openProject}>
-            <GithubMark />
-            {project.name}
+        <div className="login-links">
+          <button className="project-link" type="button" onClick={openSettings}>
+            <Settings />
+            本机设置
           </button>
-        )}
+          {project.url && (
+            <button className="project-link" type="button" onClick={openProject}>
+              <GithubMark />
+              {project.name}
+            </button>
+          )}
+        </div>
       </div>
     </main>
   );

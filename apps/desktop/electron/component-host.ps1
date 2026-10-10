@@ -1,8 +1,7 @@
 param(
   [Parameter(Mandatory)][string]$Runtime,
   [Parameter(Mandatory)][string]$OpenSshDirectory,
-  [Parameter(Mandatory)][int]$OwnerProcessId,
-  [string]$FrpcPath
+  [Parameter(Mandatory)][int]$OwnerProcessId
 )
 $ErrorActionPreference = 'Stop'
 $Runtime = [IO.Path]::GetFullPath($Runtime)
@@ -106,7 +105,12 @@ public static class ComponentHost {
         var command = new StringBuilder("\""+executables[index]+"\" "+arguments[index]);
         // Assign while suspended so no component child can escape the owner's job.
         if(!CreateProcess(executables[index],command,IntPtr.Zero,IntPtr.Zero,true,CreateNoWindow | CreateSuspended,
-          IntPtr.Zero,null,ref startup,out info)) throw new Win32Exception();
+          IntPtr.Zero,null,ref startup,out info)) {
+          var refused = new Win32Exception();
+          // Read by the client to tell the user which component the system would not start, and why.
+          Console.Error.WriteLine("cc-desk-tunnel: cannot start "+Path.GetFileName(executables[index])+" error "+refused.NativeErrorCode);
+          throw refused;
+        }
         processes[index] = info.process;
         try {
           if(!AssignProcessToJobObject(job,info.process)) {
@@ -126,6 +130,7 @@ public static class ComponentHost {
       if(completed >= executables.Length) return 0;
       uint code;
       if(!GetExitCodeProcess(processes[completed],out code)) throw new Win32Exception();
+      Console.Error.WriteLine("cc-desk-tunnel: "+Path.GetFileName(executables[completed])+" exited "+code);
       return code == 0 ? 1 : (int)code;
     } finally {
       CloseHandle(job);
@@ -144,13 +149,13 @@ public static class ComponentHost {
 '@
 $executables = @((Join-Path $OpenSshDirectory 'sshd.exe'))
 $arguments = @("-D -e -f `"$(Join-Path $Runtime 'sshd_config')`"")
-if ($FrpcPath) {
-  $executables += $FrpcPath
-  $arguments += "-c `"$(Join-Path $Runtime 'frpc.json')`""
-}
 # sshd detaches its session process, so each command's cmd.exe would open a visible console on the user's desktop.
 # This OpenSSH switch makes sshd create its children with CREATE_NO_WINDOW; it is set for this host's children only.
 $env:SSH_TEST_ENVIRONMENT = '1'
+# OpenSSH hands the state of its descriptors to its own children in this variable. Started from inside an SSH
+# session (a command Claude runs on this computer, such as the project's own tests), sshd would take the outer
+# session's state for its own and never answer a connection once its error output is a pipe.
+Get-ChildItem Env: | Where-Object Name -Like '*_POSIX_FD_STATE' | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
 $code = 1
 try {
   $code = [ComponentHost]::Run($executables, $arguments, $OwnerProcessId, (Join-Path $Runtime 'stop'))

@@ -23,21 +23,23 @@ Windows 上的 shell 命令与脚本使用 `pwsh.exe`（PowerShell 7）。终端
 
 - `README.md` 是总览、快速开始和文档索引。
 - 跨模块的说明放 `docs/`，模块细节跟随模块目录。
-- 进行中的批次可以在 `docs/tasks/` 放一份事项清单；合并后把结论并入相应文档和[变更记录](../CHANGELOG.md)，删除清单。
+- 工作清单、核对过程放在被忽略的 `.local/`，收尾清理；文档只保留功能说明、必要取舍和待验证事项。
 - 区分已验证的事实与尚未验证的实现，后者记在[路线](roadmap.md)。
 - 过时的内容直接删除或改写，不在旁边追加“已过时”的说明；历史由 Git 保留。
 
 ## 发布
 
-版本号以 `apps/desktop/package.json` 为准，两端共用；[变更记录](../CHANGELOG.md)里要有同名的一节，它会成为发布说明。
+版本号以 `apps/desktop/package.json` 为准，两端共用；[变更记录](../CHANGELOG.md)里要有同名的一节，按该文件开头说明的结构书写（一句概括，然后是新增功能、优化改进、问题修复、升级说明）。发布脚本把这一节放进固定的发布说明模板：项目简介、本版变化、下载与升级，因此每一版的发布页读起来是同一个样子。
 
 1. 在合并请求里改好版本号与变更记录，合入 `main`。
 2. 在 Windows x64 上检出最新的 `main`，准备好打包组件（`npm run prepare:windows:package`）、`gh` 和环境变量 `GH_TOKEN`。
 3. `npm run release` 构建安装包与服务端程序包，生成 `release.json`（版本、协议版本、提交、各文件的大小与 SHA256）和 `SHA256SUMS`，上传为草稿发布；核对无误后在发布页点发布，或直接用 `npm run release -- --publish`。`--dry-run` 只构建到 `artifacts/release/`，不上传。
 
-`release.json` 里的 `runtime` 是该版本所需的镜像级别，取自 `deploy/docker/runtime-level`。改动 Dockerfile、镜像入口脚本或 Node.js / frps 的版本时把这个数字加一：旧镜像上的服务端会提示在服务器上升级，而不是自行安装。只更换 Claude Code 的版本不需要加，升级时会把所需版本装进数据目录。
+`release.json` 里的 `runtime` 是该版本所需的镜像级别，取自 `deploy/docker/runtime-level`。改动 Dockerfile、镜像入口脚本或 Node.js 的版本时把这个数字加一：旧镜像上的服务端会提示在服务器上升级，而不是自行安装。只更换 Claude Code 的版本不需要加，升级时会把所需版本装进数据目录。
 
 发布在此时才打上 `v<版本>` 标签。已发布的版本不改文件，有问题就递增版本重新发布。
+
+需要预发布时使用 `npm run release -- --publish --prerelease`（不加 `--publish` 则保留草稿）。预发布不标记为 Latest，不进入服务端跟踪的稳定版自动更新；使用者需从对应发布页手动下载两端程序包。Windows 打包必经实际 exe 的离线启动检查，失败时不会继续上传。
 
 ## 凭据与本机文件
 

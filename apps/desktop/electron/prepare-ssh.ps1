@@ -19,7 +19,11 @@ foreach ($name in @('host', 'identity')) {
 }
 $publicKey = (Get-Content -LiteralPath (Join-Path $Runtime 'identity.pub') -Raw -Encoding utf8).Trim()
 Set-Content -LiteralPath (Join-Path $Runtime 'authorized_keys') -Value $publicKey -Encoding utf8NoBOM
-$username = [Security.Principal.WindowsIdentity]::GetCurrent().Name.ToLowerInvariant() -replace '^.*\\', ''
+# sshd knows a local account by its bare name and a domain account as domain\user, both in lower case. A login
+# by the bare name still finds the domain account, so that is what the service is given.
+$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name.ToLowerInvariant()
+$username = $account -replace '^.*\\', ''
+$allowed = if ($account.StartsWith($env:COMPUTERNAME.ToLowerInvariant() + '\')) { $username } else { "$account $username" }
 $path = $Runtime.Replace('\', '/')
 $bin = $OpenSshDirectory.Replace('\', '/')
 @"
@@ -30,7 +34,10 @@ AuthorizedKeysFile "$path/authorized_keys"
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-AllowUsers $username
+AllowUsers $allowed
+# Commands started together each open a connection of their own; the default would drop some of them at random
+# once ten are signing in at the same time.
+MaxStartups 64
 AllowTcpForwarding no
 PermitTunnel no
 X11Forwarding no

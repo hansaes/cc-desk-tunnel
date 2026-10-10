@@ -30,10 +30,17 @@ export type ClaudeRun = {
   resume: boolean;
   signal: AbortSignal;
   emit: (event: EventPayload) => void;
-  approve: (toolId: string) => Promise<boolean>;
+  // Asks the user about a tool call. A question Claude asks comes back with the answers chosen.
+  approve: (
+    toolId: string,
+    waiting: 'approval' | 'question',
+  ) => Promise<{ allowed: boolean; answers?: Record<string, string> }>;
   ssh: SshConnection;
-  // Filled in while the CLI is running, so the service can ask it for fresh account quota mid-run.
-  controls: { refresh?: () => Promise<void> };
+  // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
+  waiting: (background: boolean) => void;
+  // Filled in while the CLI is running, so the service can ask it for fresh account quota mid-run and end
+  // one of its background tasks.
+  controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 // `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
 export function remotePrompt(projectPath: string, ssh: SshConnection, sessionId: string) {
@@ -99,6 +106,8 @@ export async function runClaude(
   let stderr = '',
     failure: Error | undefined;
   let session: Query | undefined;
+  let settle: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
   try {
     session = query({
       prompt: run.input.stream(),
@@ -130,12 +139,24 @@ export async function runClaude(
         },
         canUseTool: async (name, input, context) => {
           const tool = mapper.tool(name, input, context.toolUseID);
-          const allowed =
-            !context.signal.aborted && !run.signal.aborted && (await run.approve(tool.id));
+          const question = name === 'AskUserQuestion';
+          const { allowed, answers } =
+            context.signal.aborted || run.signal.aborted
+              ? { allowed: false }
+              : await run.approve(tool.id, question ? 'question' : 'approval');
           tool.denied = !allowed;
-          return allowed
-            ? { behavior: 'allow', updatedInput: input }
-            : { behavior: 'deny', message: 'The Windows user denied or cancelled this request.' };
+          if (!allowed)
+            return {
+              behavior: 'deny',
+              message: question
+                ? 'The Windows user declined to answer.'
+                : 'The Windows user denied or cancelled this request.',
+            };
+          // The official tool takes the user's choices as `answers`, keyed by question text.
+          return {
+            behavior: 'allow',
+            updatedInput: question && answers ? { ...input, answers } : input,
+          };
         },
       },
     });
@@ -153,13 +174,50 @@ export async function runClaude(
     let refreshedAt = 0;
     let quotaAt = Date.now();
     const running = session;
+    run.controls.stopTask = (taskId) => running.stopTask(taskId);
     run.controls.refresh = async () => {
       const payload = await nativeMetrics(running);
       if (payload.type === 'native.metrics') metrics = payload;
       quotaAt = Date.now();
       if (!run.signal.aborted) run.emit(payload);
     };
+    // Background Bash tasks and subagents live in the CLI process, and the completion of one starts a turn of
+    // its own. Closing the CLI with the turn that started them would kill them, so the run stays open until
+    // none is left.
+    let background = 0;
+    let idle = false;
+    let told = false;
     for await (const message of session) {
+      if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
+        const tasks = message.tasks.filter((task) => !task.ambient);
+        background = tasks.length;
+        if (!run.signal.aborted)
+          run.emit({
+            type: 'native.tasks',
+            tasks: tasks.map((task) => ({
+              id: task.task_id,
+              kind: task.task_type,
+              description: task.description,
+            })),
+          });
+        // The turn a finished task starts follows at once, announced by the CLI's `init`. When none does,
+        // as after the user ended the last task, nothing is left to wait for.
+        clearTimeout(settle);
+        if (idle && !background)
+          settle = setTimeout(() => {
+            settled = true;
+            run.input.close();
+            running.close();
+          }, 3000);
+      } else if (
+        (message.type === 'system' && message.subtype === 'init') ||
+        ['user', 'assistant', 'stream_event'].includes(message.type)
+      ) {
+        if (told && !run.signal.aborted) run.waiting(false);
+        told = false;
+        idle = false;
+        clearTimeout(settle);
+      }
       if (!run.signal.aborted) {
         run.input.observe(message);
         mapper.accept(message);
@@ -191,7 +249,7 @@ export async function runClaude(
       }
       if (message.type === 'result') {
         await refresh;
-        const done = run.input.endTurn(message);
+        const done = run.input.endTurn(message, background > 0);
         if (!run.signal.aborted) {
           try {
             const payload = await nativeMetrics(session, message);
@@ -202,12 +260,20 @@ export async function runClaude(
           }
         }
         if (done || run.signal.aborted) break;
+        idle = true;
+        if (background) {
+          told = true;
+          run.waiting(true);
+        }
       }
     }
   } catch (error) {
-    failure = error instanceof Error ? error : new Error('Native SDK process failed.');
+    if (!settled)
+      failure = error instanceof Error ? error : new Error('Native SDK process failed.');
   } finally {
+    clearTimeout(settle);
     run.controls.refresh = undefined;
+    run.controls.stopTask = undefined;
     run.input.close();
     session?.close();
     run.signal.removeEventListener('abort', stop);

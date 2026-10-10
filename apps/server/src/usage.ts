@@ -6,12 +6,14 @@ type Summary = Omit<Extract<ServerMessage, { type: 'usage.summary' }>, 'type' | 
 type Page = Omit<Extract<ServerMessage, { type: 'usage.page' }>, 'type' | 'requestId'>;
 type RateLimits = {
   windows: { name: string; utilization: number | null; resetsAt: string | null }[];
+  measuredAt?: string | null;
 };
 export type UsageQuery = {
   from?: string;
   to?: string;
   model?: string;
   beforeId?: number;
+  offset?: number;
   limit: number;
   bucketMinutes: number;
   offsetMinutes: number;
@@ -20,6 +22,9 @@ export type UsageQuery = {
 const windowLength: Record<string, number> = { five_hour: 5 * 3600_000 };
 const lengthOf = (name: string) =>
   windowLength[name] ?? (name.startsWith('seven_day') ? 7 * 24 * 3600_000 : undefined);
+// Two readings taken at the same moment can differ by a point, and the later one may be the lower; a reset
+// takes away far more than that.
+const resetDrop = 5;
 const totals = `COUNT(*) AS requests, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens,
   COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens, COALESCE(SUM(cache_creation_tokens), 0) AS cacheCreationTokens,
   COALESCE(SUM(cost_usd), 0) AS costUsd`;
@@ -55,8 +60,96 @@ export class UsageLog {
       CREATE TABLE IF NOT EXISTS usage_windows (
         name TEXT PRIMARY KEY, started_at INTEGER NOT NULL, resets_at INTEGER, utilization REAL, observed_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
     `);
+    this.restoreStarts();
     this.prune();
+  }
+  // Periods that a one-point dip in the reported utilization had cut short get back the start their reset time
+  // implies. Only the period boundary is corrected; the request records were never touched.
+  private restoreStarts(now = Date.now()) {
+    if (this.database.prepare("SELECT 1 FROM migrations WHERE name = 'usage-window-start'").get())
+      return;
+    const windows = (
+      this.database.prepare('SELECT name, started_at, resets_at FROM usage_windows').all() as {
+        name: string;
+        started_at: number;
+        resets_at: number | null;
+      }[]
+    ).flatMap((window) => {
+      const length = lengthOf(window.name);
+      if (!length || !window.resets_at || window.resets_at <= now) return [];
+      const expected = window.resets_at - length;
+      return window.started_at > expected
+        ? [{ ...window, resets_at: window.resets_at, expected }]
+        : [];
+    });
+    this.database.exec('BEGIN');
+    try {
+      // The stored start alone cannot tell a cut-short period from one a reset card began, so the quota readings
+      // kept with the sessions are read once, and only when some period needs it.
+      const resets = windows.length ? this.earlyResets(windows, now) : new Map<string, number>();
+      for (const window of windows)
+        this.database
+          .prepare('UPDATE usage_windows SET started_at = ? WHERE name = ?')
+          .run(
+            Math.min(window.started_at, Math.max(window.expected, resets.get(window.name) ?? 0)),
+            window.name,
+          );
+      this.database.prepare("INSERT INTO migrations VALUES ('usage-window-start')").run();
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  // The last time each period's utilization fell as a reset makes it fall while its reset time stayed the same.
+  private earlyResets(
+    windows: { name: string; resets_at: number; expected: number }[],
+    now: number,
+  ) {
+    const resets = new Map<string, number>();
+    if (
+      !this.database
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'")
+        .get()
+    )
+      return resets;
+    // The text test spares parsing every event of every session; few of them are quota readings.
+    const readings = (
+      this.database
+        .prepare(
+          `SELECT COALESCE(json_extract(data, '$.payload.rateLimits.measuredAt'), json_extract(data, '$.createdAt')) AS at,
+            json_extract(data, '$.payload.rateLimits.windows') AS windows
+          FROM events
+          WHERE instr(data, '"native.metrics"') > 0 AND json_extract(data, '$.payload.type') = 'native.metrics'
+            AND json_extract(data, '$.payload.rateLimits.available') = 1`,
+        )
+        .all() as { at: string; windows: string }[]
+    )
+      .map((row) => ({
+        at: Date.parse(row.at),
+        windows: (JSON.parse(row.windows) ?? []) as RateLimits['windows'],
+      }))
+      .filter((reading) => reading.at <= now)
+      .sort((a, b) => a.at - b.at);
+    for (const window of windows) {
+      let previous: { at: number; utilization: number | null } | undefined;
+      for (const { at, windows } of readings) {
+        const reading = windows.find((item) => item.name === window.name);
+        const end = reading?.resetsAt && Date.parse(reading.resetsAt);
+        if (!reading || !end || Math.abs(end - window.resets_at) > 5 * 60_000) continue;
+        if (at < window.expected || (previous && at <= previous.at)) continue;
+        if (
+          reading.utilization !== null &&
+          previous?.utilization != null &&
+          previous.utilization - reading.utilization >= resetDrop
+        )
+          resets.set(window.name, previous.at);
+        previous = { at, utilization: reading.utilization };
+      }
+    }
+    return resets;
   }
   // Accepts one OTLP/HTTP JSON log export and keeps only the model request records.
   ingest(body: unknown) {
@@ -109,8 +202,9 @@ export class UsageLog {
     return stored;
   }
   // Statistics follow the official quota periods. A period ends when the reported reset time moves or the utilization
-  // drops, which also covers resets granted outside the normal schedule.
+  // falls by more than the jitter between readings, which also covers resets granted outside the normal schedule.
   observe(rateLimits: RateLimits, now = Date.now()) {
+    const measuredAt = (rateLimits.measuredAt && Date.parse(rateLimits.measuredAt)) || now;
     for (const window of rateLimits.windows) {
       const previous = this.database
         .prepare(
@@ -124,10 +218,13 @@ export class UsageLog {
             observed_at: number;
           }
         | undefined;
+      // A long turn repeats its last reading with every context refresh, by then possibly older than another
+      // session's; only a newer reading says anything.
+      if (previous && measuredAt <= previous.observed_at) continue;
       const resetsAt = window.resetsAt ? Date.parse(window.resetsAt) || null : null;
       const length = lengthOf(window.name);
       const expected = resetsAt && length ? resetsAt - length : undefined;
-      let startedAt = previous?.started_at ?? Math.min(now, expected ?? now);
+      let startedAt = previous?.started_at ?? Math.min(measuredAt, expected ?? measuredAt);
       if (
         previous &&
         ((resetsAt !== null &&
@@ -135,17 +232,25 @@ export class UsageLog {
           Math.abs(resetsAt - previous.resets_at) > 5 * 60_000) ||
           (window.utilization !== null &&
             previous.utilization !== null &&
-            window.utilization < previous.utilization))
+            previous.utilization - window.utilization >= resetDrop))
       )
         // The reset happened between the two observations; the reported period start is used when it falls in between.
-        startedAt = Math.min(now, Math.max(previous.observed_at, expected ?? now));
+        startedAt = Math.min(measuredAt, Math.max(previous.observed_at, expected ?? measuredAt));
+      // An expired window is reported without a reset time until its next period begins; the last one known
+      // stays, so that the next period is recognised by its new reset time however little had been used.
       this.database
         .prepare(
           `INSERT INTO usage_windows (name, started_at, resets_at, utilization, observed_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET started_at = excluded.started_at, resets_at = excluded.resets_at,
           utilization = excluded.utilization, observed_at = excluded.observed_at`,
         )
-        .run(window.name, startedAt, resetsAt, window.utilization, now);
+        .run(
+          window.name,
+          startedAt,
+          resetsAt ?? previous?.resets_at ?? null,
+          window.utilization,
+          measuredAt,
+        );
     }
   }
   summary(now = Date.now()): Summary {
@@ -194,12 +299,14 @@ export class UsageLog {
       .prepare(
         `SELECT id, at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
         cost_usd, duration_ms, ttft_ms, source FROM api_requests
-      WHERE ${filtered}${query.beforeId ? ' AND id < ?' : ''} ORDER BY id DESC LIMIT ?`,
+      WHERE ${filtered}${query.beforeId ? ' AND id < ?' : ''} ORDER BY id DESC LIMIT ? OFFSET ?`,
       )
-      .all(...values, ...(query.beforeId ? [query.beforeId] : []), query.limit + 1) as Record<
-      string,
-      number | string | null
-    >[];
+      .all(
+        ...values,
+        ...(query.beforeId ? [query.beforeId] : []),
+        query.limit + 1,
+        query.offset ?? 0,
+      ) as Record<string, number | string | null>[];
     const total = this.database
       .prepare(
         `SELECT ${totals}, COALESCE(SUM(duration_ms), 0) AS durationMs, AVG(ttft_ms) AS ttftMs,
@@ -213,15 +320,22 @@ export class UsageLog {
     const series = this.database
       .prepare(
         `SELECT CAST((at + ?) / ? AS INTEGER) AS bucket, COUNT(*) AS requests, SUM(cost_usd) AS costUsd,
-        SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS tokens
+        SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS tokens,
+        SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens,
+        SUM(cache_read_tokens) AS cacheReadTokens, SUM(cache_creation_tokens) AS cacheCreationTokens
       FROM api_requests WHERE ${filtered} GROUP BY bucket ORDER BY bucket`,
       )
-      .all(offset, bucket, ...values) as {
+      .all(offset, bucket, ...values) as ({
       bucket: number;
-      requests: number;
-      costUsd: number;
       tokens: number;
-    }[];
+    } & Page['series'][number])[];
+    // Like the model list, the breakdown covers every model of the range, whichever one is being looked at.
+    const byModel = this.database
+      .prepare(
+        `SELECT model, ${totals} FROM api_requests WHERE ${conditions.join(' AND ')}
+        GROUP BY model ORDER BY costUsd DESC, requests DESC, model`,
+      )
+      .all(...range) as Page['byModel'];
     const { streamedTokens, streamedMs, ...sums } = total;
     return {
       rows: rows.slice(0, query.limit).map((row) => ({
@@ -245,18 +359,11 @@ export class UsageLog {
         outputPerSecond: streamedTokens && streamedMs ? streamedTokens / (streamedMs / 1000) : null,
       },
       // The model list ignores the model filter so the filter can be changed from any selection.
-      models: (
-        this.database
-          .prepare(
-            `SELECT DISTINCT model FROM api_requests WHERE ${conditions.join(' AND ')} ORDER BY model`,
-          )
-          .all(...range) as { model: string }[]
-      ).map((row) => row.model),
-      series: series.map((item) => ({
-        at: new Date(item.bucket * bucket - offset).toISOString(),
-        requests: item.requests,
-        tokens: item.tokens,
-        costUsd: item.costUsd,
+      models: byModel.map((row) => row.model).sort(),
+      byModel,
+      series: series.map(({ bucket: index, ...item }) => ({
+        ...item,
+        at: new Date(index * bucket - offset).toISOString(),
       })),
     };
   }

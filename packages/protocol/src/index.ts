@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 13;
 export const MAX_FRAME_BYTES = 256 * 1024;
 const id = z.uuid();
 const timestamp = z.iso.datetime();
@@ -48,6 +48,16 @@ export const nativeSettingsSchema = z.object({
   fileCheckpointingEnabled: toggle,
   promptCacheTtl: z.enum(['5m', '1h']).nullable(),
   language: z.string().trim().min(1).max(60).nullable(),
+  precomputeCompactionEnabled: toggle,
+  autoDreamEnabled: toggle,
+  subagentPromptCacheTtl: z.enum(['5m', '1h']).nullable(),
+  fallbackModel: z.array(z.string().trim().min(1).max(200)).min(1).max(5).nullable(),
+  askUserQuestionTimeout: z.enum(['60s', '5m', '10m', 'never']).nullable(),
+  bashOutputMaxChars: z.number().int().min(4000).max(128_000).nullable(),
+  // The CLI also takes an object of custom texts here; the GUI only offers hiding the attribution, and shows
+  // anything else as unset.
+  attribution: z.literal(false).nullable(),
+  includeGitInstructions: toggle,
 });
 export type NativeSettings = z.infer<typeof nativeSettingsSchema>;
 export const contextUsageSchema = z.object({
@@ -132,11 +142,17 @@ export const usagePageSchema = z.object({
     outputPerSecond: z.number().nonnegative().nullable(),
   }),
   models: z.array(z.string()),
+  // Every model of the time range, whatever the model filter, the costliest first.
+  byModel: z.array(z.object({ model: z.string(), ...usageTotals })),
   series: z.array(
     z.object({
       at: timestamp,
       requests: z.number().int().nonnegative(),
       tokens: z.number().nonnegative(),
+      inputTokens: z.number().nonnegative(),
+      outputTokens: z.number().nonnegative(),
+      cacheReadTokens: z.number().nonnegative(),
+      cacheCreationTokens: z.number().nonnegative(),
       costUsd: z.number().nonnegative(),
     }),
   ),
@@ -150,9 +166,13 @@ export const runStatusSchema = z.enum([
   'cancelled',
   'failed',
 ]);
+// What a run waits for. In `awaiting_approval`: a decision on a tool, or an answer to a question Claude asked.
+// While `running`, `background`: Claude has finished its turn and only the background tasks it started go on.
+export const waitingSchema = z.enum(['approval', 'question', 'background']);
 export const terminalStatuses = new Set<RunStatus>(['completed', 'cancelled', 'failed']);
 export type RunStatus = z.infer<typeof runStatusSchema>;
 
+const scenarioSchema = z.enum(['chat', 'tool', 'question', 'error']);
 const toolSchema = z.object({
   toolId: z.string().min(1),
   name: z.string().min(1),
@@ -164,7 +184,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     type: z.literal('message.user'),
     messageId: id,
     text: z.string(),
-    scenario: z.enum(['chat', 'tool', 'error']),
+    scenario: scenarioSchema,
   }),
   z.object({
     type: z.literal('message.delivery'),
@@ -176,6 +196,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     status: runStatusSchema,
     connectionId: id,
     surface: z.enum(['chat', 'terminal']).optional(),
+    waiting: waitingSchema.optional(),
     reason: z.string().optional(),
   }),
   z.object({ type: z.literal('text.delta'), messageId: id, text: z.string() }),
@@ -197,6 +218,11 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     updatedAt: timestamp.optional(),
   }),
   z.object({ type: z.literal('native.notice'), text: z.string() }),
+  // The background tasks alive in the run's CLI; each list replaces the one before.
+  z.object({
+    type: z.literal('native.tasks'),
+    tasks: z.array(z.object({ id: z.string().min(1), kind: z.string(), description: z.string() })),
+  }),
   z.object({
     type: z.literal('native.capabilities'),
     models: z.array(modelInfoSchema),
@@ -265,6 +291,20 @@ export const sessionSchema = z.object({
   effort: effortSchema.nullable().default(null),
   // A fork keeps its native history beside the session it was forked from; this names that session.
   nativeRoot: id.optional(),
+  // What the system prompt of the session's native runs says. It is kept word for word until a compaction,
+  // which loses the prompt cache anyway: a move to another project, or a PowerShell path that differs on the
+  // connection in use, is told to Claude with the user's next message instead (`toldPowershellPath` is the
+  // path it was last told that way).
+  prompt: z
+    .object({
+      projectPath: z.string(),
+      powershellPath: z.string().optional(),
+      toldPowershellPath: z.string().optional(),
+      compacted: z.boolean().optional(),
+    })
+    .optional(),
+  // The project path Claude was last told, while the move away from it has not been mentioned to it yet.
+  movedFrom: z.string().optional(),
   createdAt: timestamp,
   updatedAt: timestamp,
   activeRun: z
@@ -273,6 +313,7 @@ export const sessionSchema = z.object({
       status: runStatusSchema,
       connectionId: id,
       surface: z.enum(['chat', 'terminal']).optional(),
+      waiting: waitingSchema.optional(),
     })
     .nullable(),
 });
@@ -348,6 +389,8 @@ export const commandSchema = z.discriminatedUnion('type', [
       to: timestamp.optional(),
       model: z.string().min(1).max(200).optional(),
       beforeId: z.number().int().positive().optional(),
+      // Rows to skip from the newest, for a page of a range whose end is fixed.
+      offset: z.number().int().min(0).max(10_000_000).optional(),
       limit: z.number().int().min(1).max(200).default(100),
       bucketMinutes: z.number().int().min(5).max(1440).default(60),
       // Minutes east of UTC, so day buckets follow the viewer's calendar.
@@ -371,6 +414,15 @@ export const commandSchema = z.discriminatedUnion('type', [
       permissionMode: permissionModeSchema,
       model: z.string().trim().min(1).max(200).nullable().optional(),
       effort: effortSchema.nullable().optional(),
+    })
+    .strict(),
+  // Points a session at another Windows project directory.
+  z
+    .object({
+      type: z.literal('session.move'),
+      ...request,
+      sessionId: id,
+      projectPath: z.string().trim().min(1).max(2048),
     })
     .strict(),
   z.object({ type: z.literal('session.compact'), ...request, sessionId: id }).strict(),
@@ -419,10 +471,19 @@ export const commandSchema = z.discriminatedUnion('type', [
       ...request,
       sessionId: id,
       text: z.string().trim().min(1).max(16000),
-      scenario: z.enum(['chat', 'tool', 'error']).default('chat'),
+      scenario: scenarioSchema.default('chat'),
     })
     .strict(),
   z.object({ type: z.literal('run.cancel'), ...request, sessionId: id, runId: id }).strict(),
+  z
+    .object({
+      type: z.literal('run.task.stop'),
+      ...request,
+      sessionId: id,
+      runId: id,
+      taskId: z.string().min(1).max(200),
+    })
+    .strict(),
   z
     .object({
       type: z.literal('approval.reply'),
@@ -431,6 +492,8 @@ export const commandSchema = z.discriminatedUnion('type', [
       runId: id,
       approvalId: id,
       allowed: z.boolean(),
+      // The answers to a question Claude asked, keyed by the question's text.
+      answers: z.record(z.string().max(2000), z.string().max(4000)).optional(),
     })
     .strict(),
 ]);
@@ -463,6 +526,7 @@ export const terminalControlSchema = z.discriminatedUnion('type', [
     .strict(),
 ]);
 export type TerminalControl = z.infer<typeof terminalControlSchema>;
+const tunnelSecret = z.string().min(32).max(128);
 export const authSchema = z
   .object({
     type: z.literal('auth'),
@@ -527,19 +591,28 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     client: installerSchema.optional(),
   }),
   z.object({ type: z.literal('service.update'), ...serviceUpdateSchema.shape }),
-  z.object({
-    type: z.literal('tunnel.configure'),
-    connectionId: id,
-    serverAddr: z.string().min(1),
-    serverPort: z.number().int().min(1).max(65535),
-    remotePort: z.number().int().min(1).max(65535),
-    token: z.string().min(24),
-    certificate: z.string().min(1),
-    serverName: z.string().min(1),
-  }),
+  // The execution channel runs over connections the device opens to this same address. `secret` signs them
+  // in; it belongs to this connection alone and ends with it.
+  z.object({ type: z.literal('tunnel.offer'), connectionId: id, secret: tunnelSecret }),
+  // An SSH connection is waiting on the service: the device opens one connection for it and attaches it.
+  z.object({ type: z.literal('tunnel.open'), connectionId: id, channelId: id }),
   z.object({ type: z.literal('tunnel.ready'), connectionId: id }),
 ]);
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
+
+// The first and only text frame of a channel connection. Once the service has accepted it, every frame in
+// either direction is the bytes of one SSH connection, and closing the connection ends that one.
+export const tunnelAttachSchema = z
+  .object({
+    type: z.literal('tunnel.attach'),
+    connectionId: id,
+    channelId: id,
+    secret: tunnelSecret,
+  })
+  .strict();
+export type TunnelAttach = z.infer<typeof tunnelAttachSchema>;
+// How a channel connection is closed when it could not be attached.
+export const TUNNEL_CLOSE = { refused: 4001, unknown: 4004 } as const;
 
 export const tunnelCredentialsSchema = z
   .object({

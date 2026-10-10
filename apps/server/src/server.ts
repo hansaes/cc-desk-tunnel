@@ -1,5 +1,5 @@
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import type { IncomingMessage, RequestListener } from 'node:http';
@@ -16,6 +16,8 @@ import {
   commandSchema,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  TUNNEL_CLOSE,
+  tunnelAttachSchema,
   tunnelCredentialsSchema,
   terminalControlSchema,
 } from '@cc-desk-tunnel/protocol';
@@ -40,7 +42,7 @@ import type { NativeTerminal } from './native-terminal.ts';
 import { simulate } from './simulation.ts';
 import { SessionStore } from './store.ts';
 import { Throttle } from './throttle.ts';
-import { WindowsTunnel } from './tunnel.ts';
+import { Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
 import type { TunnelOptions } from './tunnel.ts';
 import { ServiceUpdates, serviceVersion } from './updates.ts';
 import type { UpdateOptions } from './updates.ts';
@@ -51,7 +53,7 @@ type Peer = {
   id: string;
   address: string;
   authenticated: boolean;
-  tunnel?: WindowsTunnel;
+  tunnel?: Tunnel;
   registering: boolean;
   subscriptions: Set<string>;
   responses: Map<string, { command: string; response: Promise<ServerMessage> }>;
@@ -65,11 +67,11 @@ export type Run = {
   toolId?: string;
   toolFinished: boolean;
   approvalId?: string;
-  decide?: (allowed: boolean) => void;
-  approvals: Map<string, (allowed: boolean) => void>;
+  decide?: (allowed: boolean, answers?: Record<string, string>) => void;
+  approvals: Map<string, (allowed: boolean, answers?: Record<string, string>) => void>;
   cancelReason?: string;
   input?: NativeInput;
-  controls: { refresh?: () => Promise<void> };
+  controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 type Terminal = { id: string; sessionId: string; owner: Peer; process?: NativeTerminal };
 type Login = { process: NativeLogin; owner: Peer; url?: string };
@@ -95,7 +97,7 @@ export function createProxyServer(options: ServerOptions) {
     throw new Error('PROXY_TOKEN must contain at least 24 characters.');
   if (options.claude && (!options.tunnel || (!options.tls && !options.reverseProxy)))
     throw new Error(
-      'Native mode requires TLS or explicit reverse proxy mode, and frps configuration.',
+      'Native mode requires TLS or explicit reverse proxy mode, and the execution channel.',
     );
   const store = new SessionStore(options.dataDir);
   const usage = new UsageLog(store.database);
@@ -136,11 +138,11 @@ export function createProxyServer(options: ServerOptions) {
     (options.reverseProxy && [request.headers['x-real-ip']].flat()[0]) ||
     request.socket.remoteAddress ||
     'unknown';
-  function refuse(address: string) {
+  function refuse(address: string, what = 'service token') {
     const count = throttle.fail(address);
     const wait = throttle.blocked(address);
     console.log(
-      `Sign-in refused from ${address}: wrong service token, ${count} in a row${wait ? `; blocked for ${wait}s` : ''}`,
+      `Sign-in refused from ${address}: wrong ${what}, ${count} in a row${wait ? `; blocked for ${wait}s` : ''}`,
     );
   }
 
@@ -227,6 +229,7 @@ export function createProxyServer(options: ServerOptions) {
         type: 'session.updated',
         session: store.renameNative(run.sessionId, payload.title),
       });
+    if (payload.type === 'native.compact') store.compacted(run.sessionId);
     if (payload.type === 'run.status') updated(run.sessionId);
   }
   function finish(run: Run, status: 'completed' | 'cancelled' | 'failed', reason?: string) {
@@ -266,33 +269,46 @@ export function createProxyServer(options: ServerOptions) {
   async function native(run: Run) {
     try {
       const { session } = store.get(run.sessionId);
+      const ssh = run.owner.tunnel!.ssh!;
+      const said = store.promptValues(run.sessionId, ssh.powershellPath);
       const status = await runClaude(options.claude!, {
         sessionId: run.sessionId,
         nativeRoot: session.nativeRoot ?? session.id,
-        projectPath: session.projectPath,
+        projectPath: said.projectPath,
         permissionMode: session.permissionMode,
         model: session.model,
         effort: session.effort,
         input: run.input!,
         controls: run.controls,
+        waiting: (background) =>
+          emit(run, {
+            type: 'run.status',
+            status: 'running',
+            connectionId: run.owner.id,
+            ...(background ? { waiting: 'background' as const } : {}),
+          }),
         dataDir: store.directory,
         resume: store.hasNativeContext(run.sessionId),
         signal: run.controller.signal,
-        ssh: run.owner.tunnel!.ssh!,
+        ssh: {
+          ...sessionSsh(store.directory, run.sessionId, ssh),
+          powershellPath: said.powershellPath,
+        },
         emit: (event) => emit(run, event),
-        approve: (toolId) => {
-          if (run.controller.signal.aborted) return Promise.resolve(false);
+        approve: (toolId, waiting) => {
+          if (run.controller.signal.aborted) return Promise.resolve({ allowed: false });
           const approvalId = randomUUID();
-          return new Promise<boolean>((resolve) => {
-            run.approvals.set(approvalId, (allowed) => {
+          return new Promise((resolve) => {
+            run.approvals.set(approvalId, (allowed, answers) => {
               emit(run, { type: 'approval.resolved', approvalId, allowed });
-              resolve(allowed);
+              resolve({ allowed, answers });
             });
             emit(run, { type: 'approval.requested', approvalId, toolId });
             emit(run, {
               type: 'run.status',
               status: 'awaiting_approval',
               connectionId: run.owner.id,
+              waiting,
             });
           });
         },
@@ -437,7 +453,11 @@ export function createProxyServer(options: ServerOptions) {
       completeOnboarding();
       current.process = new NativeTerminal(
         options.claude.executable,
-        terminalArguments(options.claude, session, peer.tunnel.ssh),
+        terminalArguments(
+          options.claude,
+          session,
+          sessionSsh(store.directory, session.id, peer.tunnel.ssh),
+        ),
         {
           cwd: prepareNativeDirectory(options.claude, store.directory, nativeRoot(session.id)),
           cols: command.cols,
@@ -502,6 +522,7 @@ export function createProxyServer(options: ServerOptions) {
       }
       if (command.type === 'session.delete') {
         store.delete(command.sessionId);
+        rmSync(sessionSshPath(store.directory, command.sessionId), { force: true });
         broadcast({ type: 'session.deleted', sessionId: command.sessionId });
         for (const other of peers) other.subscriptions.delete(command.sessionId);
       } else {
@@ -608,7 +629,10 @@ export function createProxyServer(options: ServerOptions) {
       active.input.assertWritable();
       peer.subscriptions.add(command.sessionId);
       emit(active, { type: 'message.user', messageId: command.requestId, text, scenario });
-      active.input.submit(command.requestId, text);
+      active.input.submit(
+        command.requestId,
+        store.notice(command.sessionId, peer.tunnel?.ssh?.powershellPath) + text,
+      );
       return;
     }
     if (options.claude && mutations.size)
@@ -637,7 +661,12 @@ export function createProxyServer(options: ServerOptions) {
       scenario,
     });
     emit(run, { type: 'run.status', status: 'running', connectionId: run.owner.id });
-    run.input?.submit(command.requestId, text);
+    // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
+    // user's own text.
+    run.input?.submit(
+      command.requestId,
+      store.notice(command.sessionId, peer.tunnel?.ssh?.powershellPath) + text,
+    );
     track(
       options.claude
         ? native(run)
@@ -649,11 +678,20 @@ export function createProxyServer(options: ServerOptions) {
           }),
     );
   }
-  function controlRun(peer: Peer, command: CommandOf<'run.cancel' | 'approval.reply'>) {
+  function controlRun(
+    peer: Peer,
+    command: CommandOf<'run.cancel' | 'run.task.stop' | 'approval.reply'>,
+  ) {
     const run = runs.get(command.sessionId);
     if (!run || run.id !== command.runId)
       throw new DomainError('run_inactive', '运行已结束，操作未生效。');
     if (run.owner !== peer) throw new DomainError('not_owner', '该运行属于另一连接。');
+    if (command.type === 'run.task.stop') {
+      if (!run.controls.stopTask) throw new DomainError('task_inactive', '后台任务已经结束。');
+      // The CLI reports the task gone through its task list; a task already over is not an error.
+      void run.controls.stopTask(command.taskId).catch(() => {});
+      return;
+    }
     if (command.type === 'run.cancel') {
       cancel(
         run,
@@ -667,7 +705,7 @@ export function createProxyServer(options: ServerOptions) {
       const decide = run.approvals.get(command.approvalId);
       if (!decide) throw new DomainError('approval_inactive', '审批已失效。');
       run.approvals.delete(command.approvalId);
-      decide(command.allowed);
+      decide(command.allowed, command.answers);
       if (!run.approvals.size)
         emit(run, { type: 'run.status', status: 'running', connectionId: peer.id });
       return;
@@ -676,7 +714,7 @@ export function createProxyServer(options: ServerOptions) {
       throw new DomainError('approval_inactive', '审批已失效。');
     const decide = run.decide;
     run.decide = undefined;
-    decide(command.allowed);
+    decide(command.allowed, command.answers);
   }
 
   // Resolves to the session ID carried in the response frame; account and usage commands have none.
@@ -769,6 +807,7 @@ export function createProxyServer(options: ServerOptions) {
         });
         return command.sessionId;
       case 'run.cancel':
+      case 'run.task.stop':
       case 'approval.reply':
         controlRun(peer, command);
         return command.sessionId;
@@ -792,6 +831,12 @@ export function createProxyServer(options: ServerOptions) {
           ),
         });
         break;
+      case 'session.move':
+        broadcast({
+          type: 'session.updated',
+          session: store.move(command.sessionId, command.projectPath),
+        });
+        break;
       case 'session.delete':
       case 'session.rename':
         await manageSession(command, session);
@@ -810,7 +855,7 @@ export function createProxyServer(options: ServerOptions) {
     releases.current
       ? (({ version, size, sha256 }) => ({ version, size, sha256 }))(releases.current)
       : undefined;
-  // The first frame must authenticate; a desktop client also asks for its Windows tunnel here.
+  // The first frame must authenticate; a desktop client also asks for its execution channel here.
   function authenticate(peer: Peer, value: unknown) {
     const auth = authSchema.safeParse(value);
     // Only a wrong token counts against the address: an outdated client holding the right one is not guessing.
@@ -818,7 +863,12 @@ export function createProxyServer(options: ServerOptions) {
     if (typeof token !== 'string' || !authorized(token)) refuse(peer.address);
     else throttle.succeed(peer.address);
     if (!auth.success || !authorized(auth.data.token)) {
-      send(peer, { type: 'connection.error', code: 'unauthorized', message: '认证失败。' });
+      send(peer, {
+        type: 'connection.error',
+        code: 'unauthorized',
+        message:
+          '服务凭据不正确。\n请核对安装时给出的服务凭据，注意不要带上首尾空格；在服务器上更换过凭据后要用新的。连续失败多次会被暂时拒绝。',
+      });
       peer.socket.close(4001, 'Unauthorized');
       return false;
     }
@@ -851,29 +901,65 @@ export function createProxyServer(options: ServerOptions) {
         send(peer, {
           type: 'connection.error',
           code: 'device_busy',
-          message: '已有 Windows 设备连接或正在清理，请稍后重试。',
+          message:
+            '服务端已有一台 Windows 设备在线，或上一次连接还在清理。\n同一时间只支持一台设备：请先断开另一台，或等几秒后重试。',
         });
         peer.socket.close(4003, 'Device busy');
         return true;
       }
       tunnelOwner = peer;
-      peer.tunnel = new WindowsTunnel(options.tunnel, store.directory, peer.id, () => {
-        peer.socket.close(4003, 'Tunnel process closed');
-      });
+      peer.tunnel = new Tunnel(
+        options.tunnel,
+        store.directory,
+        peer.id,
+        (channelId) => {
+          if (peer.socket.readyState !== WebSocket.OPEN) return false;
+          send(peer, { type: 'tunnel.open', connectionId: peer.id, channelId });
+          return true;
+        },
+        () => peer.socket.close(4003, 'Tunnel closed'),
+      );
       track(
         peer.tunnel
           .start()
-          .then((config) => send(peer, config))
+          .then((offer) => send(peer, offer))
           .catch(() => {
             send(peer, {
               type: 'connection.error',
               code: 'tunnel_failed',
-              message: 'frps 启动失败，请检查服务配置与端口。',
+              message:
+                '服务端没能准备好执行通道。\n请查看服务日志；数据目录不可写或服务器资源耗尽时会出现这种情况。',
             });
             peer.socket.close(4003, 'Tunnel failed');
           }),
         tunnelTasks,
       );
+    }
+    return true;
+  }
+  // A connection whose first frame attaches it to a device's tunnel carries one SSH connection and nothing
+  // else: it is no peer, receives no message and sends none. Only a wrong secret for a live tunnel counts
+  // against the address; a channel arriving after its tunnel ended is an ordinary race of disconnecting.
+  function attachChannel(peer: Peer, value: unknown) {
+    const attach = tunnelAttachSchema.safeParse(value);
+    const tunnel = attach.success
+      ? [...peers].find((owner) => owner.authenticated && owner.id === attach.data.connectionId)
+          ?.tunnel
+      : undefined;
+    if (!attach.success || !tunnel) {
+      peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown tunnel');
+      return false;
+    }
+    if (!tunnel.matches(attach.data.secret)) {
+      refuse(peer.address, 'tunnel secret');
+      peer.socket.close(TUNNEL_CLOSE.refused, 'Unauthorized');
+      return false;
+    }
+    peers.delete(peer);
+    peer.socket.removeAllListeners('message');
+    if (!tunnel.attach(attach.data.channelId, peer.socket)) {
+      peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown channel');
+      return false;
     }
     return true;
   }
@@ -893,7 +979,8 @@ export function createProxyServer(options: ServerOptions) {
           send(peer, {
             type: 'connection.error',
             code: 'ssh_failed',
-            message: 'Windows SSH / PowerShell 就绪探测失败。',
+            message:
+              '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。',
           });
           peer.socket.close(4003, 'SSH probe failed');
         }),
@@ -1003,6 +1090,8 @@ export function createProxyServer(options: ServerOptions) {
     // about 45 seconds of silence, end the connection.
     let missed = 0;
     let timedOut = false;
+    // Whether this connection still holds one of the places for those that have not signed in.
+    let signedIn = false;
     socket.on('pong', () => {
       missed = 0;
     });
@@ -1031,8 +1120,10 @@ export function createProxyServer(options: ServerOptions) {
         return;
       }
       if (!peer.authenticated) {
-        if (authenticate(peer, value)) {
+        const channel = (value as { type?: unknown } | null)?.type === 'tunnel.attach';
+        if (channel ? attachChannel(peer, value) : authenticate(peer, value)) {
           clearTimeout(authTimer);
+          signedIn = true;
           throttle.leave(address);
         }
         return;
@@ -1061,7 +1152,7 @@ export function createProxyServer(options: ServerOptions) {
     socket.on('close', (code) => {
       clearTimeout(authTimer);
       clearInterval(heartbeat);
-      if (!peer.authenticated) throttle.leave(address);
+      if (!signedIn) throttle.leave(address);
       // Why a connection ended is the first thing needed when a run was cut short.
       const owned = [...runs.values()].filter((run) => run.owner === peer).length;
       if (peer.authenticated && !closing)

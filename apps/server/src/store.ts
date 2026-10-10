@@ -51,6 +51,9 @@ function batchHistory(events: SessionEvent[]) {
   return result;
 }
 
+// Reading a session's native state when it is opened is not use of it: these do not move it up the list.
+const stateReadings = new Set<EventPayload['type']>(['native.capabilities', 'native.metrics']);
+
 export class SessionStore {
   directory: string;
   database: DatabaseSync;
@@ -76,6 +79,7 @@ export class SessionStore {
     `);
     try {
       this.importJson();
+      this.restoreUpdatedAt();
       for (const session of this.list()) {
         if (!session.activeRun) continue;
         const { id: runId, connectionId } = session.activeRun;
@@ -154,6 +158,41 @@ export class SessionStore {
           insert.run(event.sessionId, event.sequence, event.runId, JSON.stringify(event));
       }
       this.database.prepare('INSERT INTO migrations VALUES (?)').run('json-import');
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  // Sessions that had only been looked at carry the time of that look; they get back the time of what last
+  // happened in them.
+  private restoreUpdatedAt() {
+    if (this.database.prepare("SELECT 1 FROM migrations WHERE name = 'updated-at-activity'").get())
+      return;
+    const kinds = [...stateReadings].map((kind) => `'${kind}'`).join(', ');
+    const last = this.database.prepare(
+      'SELECT data FROM events WHERE session_id = ? ORDER BY sequence DESC LIMIT 1',
+    );
+    const activity = this.database.prepare(
+      `SELECT data FROM events WHERE session_id = ? AND json_extract(data, '$.payload.type') NOT IN (${kinds})
+      ORDER BY sequence DESC LIMIT 1`,
+    );
+    this.database.exec('BEGIN');
+    try {
+      for (const session of this.list()) {
+        const row = last.get(session.id);
+        if (!row) continue;
+        const event = JSON.parse(String(row.data)) as SessionEvent;
+        if (!stateReadings.has(event.payload.type) || session.updatedAt !== event.createdAt)
+          continue;
+        const before = activity.get(session.id);
+        session.updatedAt = before
+          ? (JSON.parse(String(before.data)) as SessionEvent).createdAt
+          : session.createdAt;
+        this.save(session);
+      }
+      this.database.prepare("INSERT INTO migrations VALUES ('updated-at-activity')").run();
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -395,7 +434,7 @@ export class SessionStore {
       createdAt: new Date().toISOString(),
       payload,
     };
-    session.updatedAt = event.createdAt;
+    if (!stateReadings.has(payload.type)) session.updatedAt = event.createdAt;
     if (payload.type === 'run.status')
       session.activeRun = terminalStatuses.has(payload.status)
         ? null
@@ -404,6 +443,7 @@ export class SessionStore {
             status: payload.status,
             connectionId: payload.connectionId,
             ...(payload.surface ? { surface: payload.surface } : {}),
+            ...(payload.waiting ? { waiting: payload.waiting } : {}),
           };
     this.database.exec('BEGIN');
     try {
@@ -438,6 +478,65 @@ export class SessionStore {
     session.updatedAt = new Date().toISOString();
     this.save(session);
     return session;
+  }
+  // Points the session at another project. Once Claude has been told a path, the one it knows is kept until
+  // the next message tells it of the move.
+  move(sessionId: string, projectPath: string) {
+    const { session } = this.get(sessionId);
+    if (session.activeRun) throw new DomainError('run_active', '请先结束当前运行再更换项目。');
+    if (session.projectPath === projectPath) return session;
+    if (this.hasNativeContext(sessionId)) {
+      const known = session.movedFrom ?? session.projectPath;
+      session.movedFrom = known === projectPath ? undefined : known;
+    }
+    session.projectPath = projectPath;
+    session.updatedAt = new Date().toISOString();
+    this.save(session);
+    return session;
+  }
+  // The text that tells Claude what its system prompt no longer has right, to go in front of the user's next
+  // message: a move it has not heard of, and a PowerShell path on the connection in use that is not the one
+  // it knows. Each is given out once.
+  notice(sessionId: string, powershellPath?: string) {
+    const { session } = this.get(sessionId);
+    let text = '';
+    if (session.movedFrom) {
+      text += `[CC Desk Tunnel: the user moved this session to another Windows project. The project directory is now ${JSON.stringify(session.projectPath)} (it was ${JSON.stringify(session.movedFrom)}). From now on use the new directory as the project cwd, in place of the one given earlier.]\n\n`;
+      session.movedFrom = undefined;
+    }
+    const said = session.prompt;
+    const known = said && !said.compacted && (said.toldPowershellPath ?? said.powershellPath);
+    if (said && known && powershellPath && known !== powershellPath) {
+      text += `[CC Desk Tunnel: the PowerShell executable on the connected Windows computer is now ${JSON.stringify(powershellPath)} (it was ${JSON.stringify(known)}). From now on use the new path, in place of the one given earlier.]\n\n`;
+      said.toldPowershellPath = powershellPath;
+    }
+    if (text) this.save(session);
+    return text;
+  }
+  // What the system prompt of a run says, given the PowerShell path of the connection it runs on. A prompt
+  // that changes costs the whole conversation's prompt cache, so it stays what it first was — through moves
+  // and reconnects, which `notice` tells Claude of — until a compaction, which rewrites everything after
+  // the prompt anyway; the run after that says what is current.
+  promptValues(sessionId: string, powershellPath: string) {
+    const { session } = this.get(sessionId);
+    const said = session.prompt;
+    if (said && !said.compacted) {
+      if (!said.powershellPath) {
+        said.powershellPath = powershellPath;
+        this.save(session);
+      }
+      return { projectPath: said.projectPath, powershellPath: said.powershellPath };
+    }
+    const now = { projectPath: session.projectPath, powershellPath };
+    session.prompt = now;
+    this.save(session);
+    return now;
+  }
+  compacted(sessionId: string) {
+    const { session } = this.get(sessionId);
+    if (!session.prompt || session.prompt.compacted) return;
+    session.prompt.compacted = true;
+    this.save(session);
   }
   rename(sessionId: string, title: string) {
     const { session } = this.get(sessionId);

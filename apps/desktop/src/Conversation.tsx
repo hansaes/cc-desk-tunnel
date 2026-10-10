@@ -1,4 +1,13 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ArrowUpToLine,
   Bot,
@@ -21,8 +30,14 @@ import type { Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
 import type { HistoryState } from './client.ts';
+import QuestionCard, { questionsOf } from './QuestionCard.tsx';
 import { conversation } from './transcript.ts';
 import type { TranscriptItem, Turn, Work } from './transcript.ts';
+import { CopyButton, copyText } from './copy.tsx';
+import { messageTime } from './messageTime.ts';
+import ConversationFind, { SearchExpanded } from './ConversationFind.tsx';
+import { IconButton, Menu } from './ui.tsx';
+import type { MenuItem, MenuPosition } from './ui.tsx';
 
 const RichText = lazy(() => import('./RichText.tsx'));
 const Rich = ({ text }: { text: string }) => (
@@ -38,7 +53,7 @@ type Live = {
   now: number;
   busy: boolean;
   canApprove: (tool: Tool) => boolean;
-  reply: (tool: Tool, allowed: boolean) => void;
+  reply: (tool: Tool, allowed: boolean, answers?: Record<string, string>) => void;
   // Absent while a fork cannot be made.
   edit?: (item: Text) => void;
 };
@@ -65,14 +80,16 @@ function Fold({
   children: () => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const shown = open || forced;
+  const searching = useContext(SearchExpanded);
+  const shown = open || forced || searching;
   return (
-    <details
-      className={className}
-      open={shown}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-    >
-      <summary>
+    <details className={className} open={shown}>
+      <summary
+        onClick={(event) => {
+          event.preventDefault();
+          if (!forced && !searching) setOpen(!open);
+        }}
+      >
         <ChevronRight className="fold-chevron" />
         {summary}
       </summary>
@@ -85,6 +102,17 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
   const { category, verb, subject, added, removed, running, failed } = describe(tool, active);
   const Icon = icons[category];
   const approval = live.canApprove(tool);
+  // A question Claude asks is answered, not allowed or denied.
+  const questions = tool.name === 'AskUserQuestion' ? questionsOf(tool.input) : null;
+  if (approval && questions)
+    return (
+      <QuestionCard
+        questions={questions}
+        busy={live.busy}
+        answer={(answers) => live.reply(tool, true, answers)}
+        skip={() => live.reply(tool, false)}
+      />
+    );
   return (
     <Fold
       className={`tool ${failed ? 'failed' : ''}`}
@@ -113,13 +141,25 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
     >
       {() => (
         <div className="tool-detail">
-          <pre className="tool-input">{tool.input}</pre>
-          {tool.liveOutput && !tool.output && <pre className="tool-output">{tool.liveOutput}</pre>}
-          {tool.output && (
-            <pre className="tool-output">
-              {tool.exitCode !== null && tool.exitCode !== undefined && `退出码 ${tool.exitCode}\n`}
-              {tool.output}
+          <CopyButton text={tool.input} label="复制工具输入" />
+          <pre className="tool-input" data-search-content>
+            {tool.input}
+          </pre>
+          {tool.liveOutput && !tool.output && (
+            <pre className="tool-output" data-search-content>
+              {tool.liveOutput}
             </pre>
+          )}
+          {tool.output && (
+            <>
+              <CopyButton text={tool.output} label="复制工具输出" />
+              <pre className="tool-output" data-search-content>
+                {tool.exitCode !== null &&
+                  tool.exitCode !== undefined &&
+                  `退出码 ${tool.exitCode}\n`}
+                {tool.output}
+              </pre>
+            </>
           )}
           {approval && (
             <div className="approval-actions">
@@ -189,7 +229,7 @@ function WorkGroup({
               }
             >
               {() => (
-                <div className="message-content tool-detail">
+                <div className="message-content tool-detail" data-search-content>
                   <Rich text={item.text} />
                 </div>
               )}
@@ -210,6 +250,7 @@ function Message({
   native: boolean;
   edit?: (item: Text) => void;
 }) {
+  const time = messageTime(item.at);
   return (
     <article className={`message ${item.kind}`}>
       <div className="message-label">
@@ -227,8 +268,14 @@ function Message({
         {item.kind === 'user' ? '你' : native ? 'Claude Code' : 'CC Desk Tunnel'}
         {item.kind === 'assistant' && !native && <span>模拟</span>}
         {item.kind === 'user' && item.delivery && <span>{item.delivery}</span>}
+        {time && (
+          <time className="message-time" dateTime={item.at} title={time.full}>
+            {time.short}
+          </time>
+        )}
+        <CopyButton text={item.text} />
       </div>
-      <div className="message-content">
+      <div className="message-content" data-search-content data-copy-text={item.text}>
         {item.kind === 'user' ? <p>{item.text}</p> : <Rich text={item.text} />}
       </div>
     </article>
@@ -277,6 +324,7 @@ function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: L
           key={item.id}
           className={`run-notice ${item.error ? 'failed' : ''}`}
           role={item.error ? 'alert' : 'status'}
+          data-search-content
         >
           {item.text}
         </div>
@@ -296,7 +344,10 @@ export default function Conversation({
   newSession,
   loadEarlier,
   replyApproval,
+  stopTask,
+  stop,
   edit,
+  findRequest,
 }: {
   session: Session | undefined;
   events: SessionEvent[];
@@ -306,11 +357,57 @@ export default function Conversation({
   ownsRun: boolean;
   busy: boolean;
   newSession: () => void;
-  loadEarlier: () => void;
-  replyApproval: (runId: string, approvalId: string, allowed: boolean) => void;
+  loadEarlier: () => Promise<void>;
+  findRequest: number;
+  // Ends one background task of the run, or the run with all of them.
+  stopTask: (taskId: string) => void;
+  stop: () => void;
+  replyApproval: (
+    runId: string,
+    approvalId: string,
+    allowed: boolean,
+    answers?: Record<string, string>,
+  ) => void;
   edit?: (messageId: string, text: string) => void;
 }) {
   const turns = useMemo(() => conversation(events), [events]);
+  const background = session?.activeRun?.waiting === 'background';
+  const tasks = useMemo(() => {
+    const last = events.findLast(
+      (event) => event.payload.type === 'native.tasks' && event.runId === session?.activeRun?.id,
+    )?.payload;
+    return last?.type === 'native.tasks' ? last.tasks : [];
+  }, [events, session?.activeRun?.id]);
+  const [findOpen, setFindOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [copyStatus, setCopyStatus] = useState('');
+  const [contextMenu, setContextMenu] = useState<(MenuPosition & { items: MenuItem[] }) | null>(
+    null,
+  );
+  const transcriptRoot = useRef<HTMLDivElement>(null);
+  const lastFindRequest = useRef(findRequest);
+  const searching = findOpen && query.length > 0;
+  const openFind = () => {
+    follow.current = false;
+    setFindOpen(true);
+  };
+  useEffect(() => {
+    setFindOpen(false);
+    setQuery('');
+    setLoadError('');
+    setContextMenu(null);
+    setCopyStatus('');
+  }, [session?.id]);
+  useEffect(() => {
+    if (!copyStatus) return;
+    const timer = setTimeout(() => setCopyStatus(''), 2000);
+    return () => clearTimeout(timer);
+  }, [copyStatus]);
+  useEffect(() => {
+    if (findRequest !== lastFindRequest.current) openFind();
+    lastFindRequest.current = findRequest;
+  }, [findRequest]);
   // Running timers tick once a second, and only while something runs.
   const [now, setNow] = useState(Date.now);
   const running = !!session?.activeRun;
@@ -329,7 +426,8 @@ export default function Conversation({
       session?.activeRun?.id === tool.runId &&
       !tool.resolved &&
       !!tool.approvalId,
-    reply: (tool, allowed) => replyApproval(tool.runId, tool.approvalId!, allowed),
+    reply: (tool, allowed, answers) =>
+      replyApproval(tool.runId, tool.approvalId!, allowed, answers),
     edit: edit && !running ? (item) => edit(item.id, item.text) : undefined,
   };
   const scroll = useRef<HTMLDivElement>(null);
@@ -337,6 +435,19 @@ export default function Conversation({
   const follow = useRef(true);
   // Earlier history is inserted above; the anchor keeps the lines being read where they were.
   const prependAnchor = useRef<{ sessionId: string; height: number; top: number } | null>(null);
+  const lastTop = useRef(0);
+  const loadMore = () => {
+    if (!session || !connected || !history?.hasEarlier || history.loadingEarlier || history.loading)
+      return;
+    setLoadError('');
+    if (scroll.current)
+      prependAnchor.current = {
+        sessionId: session.id,
+        height: scroll.current.scrollHeight,
+        top: scroll.current.scrollTop,
+      };
+    void loadEarlier().catch(() => setLoadError('更早记录加载失败，请重试'));
+  };
   useLayoutEffect(() => {
     prependAnchor.current = null;
     follow.current = true;
@@ -351,79 +462,189 @@ export default function Conversation({
       return;
     }
     if (anchor) return;
-    if (follow.current) scroll.current?.scrollTo(0, scroll.current.scrollHeight);
+    if (follow.current && !findOpen) scroll.current?.scrollTo(0, scroll.current.scrollHeight);
   }, [events, history?.loadingEarlier, session?.id]);
 
   return (
-    <div
-      className="conversation"
-      ref={scroll}
-      onScroll={() => {
-        if (scroll.current)
-          follow.current =
-            scroll.current.scrollHeight - scroll.current.scrollTop - scroll.current.clientHeight <
-            80;
-      }}
-    >
-      {!session ? (
-        <div className="empty-state">
-          <MessageSquare />
-          <h2>新会话</h2>
-          <button
-            type="button"
-            className="button primary"
-            disabled={!connected}
-            onClick={newSession}
-          >
-            <Plus />
-            新建会话
-          </button>
-        </div>
-      ) : (
-        <div className="transcript">
-          {history?.hasEarlier && (
-            <button
-              type="button"
-              className="history-load"
-              disabled={!connected || history.loadingEarlier || history.loading}
-              onClick={() => {
-                if (scroll.current)
-                  prependAnchor.current = {
-                    sessionId: session.id,
-                    height: scroll.current.scrollHeight,
-                    top: scroll.current.scrollTop,
-                  };
-                loadEarlier();
-              }}
-            >
-              <ArrowUpToLine />
-              {history.loadingEarlier ? '加载中' : '加载更早记录'}
-            </button>
-          )}
-          {history?.loading && (
-            <div className="history-status" role="status">
-              同步会话
-            </div>
-          )}
-          {turns.length === 0 && !history?.loading && (
-            <div className="empty-state">
-              <MessageSquare />
-              <h2>{session.title}</h2>
-              <span className="empty-project">{session.projectPath}</span>
-            </div>
-          )}
-          {turns.map((turn) => (
-            <TurnView key={turn.id} turn={turn} native={native} live={live} />
-          ))}
-          {session.activeRun && (
-            <div className="run-indicator" role="status">
-              <span className="running-dot" />
-              {session.activeRun.status === 'awaiting_approval' ? '等待审批' : '运行中'}
-              {!ownsRun && ' · 另一连接'}
-            </div>
-          )}
+    <SearchExpanded.Provider value={searching}>
+      {session && (
+        <div className="conversation-tools">
+          <span role="status">{copyStatus}</span>
+          <IconButton title="打开对话查找" onClick={openFind}>
+            <Search />
+          </IconButton>
         </div>
       )}
-    </div>
+      {findOpen && session && (
+        <ConversationFind
+          root={transcriptRoot}
+          scroll={scroll}
+          query={query}
+          change={setQuery}
+          request={findRequest}
+          partial={!!history?.hasEarlier}
+          close={() => {
+            setFindOpen(false);
+            setQuery('');
+            scroll.current?.focus();
+          }}
+        />
+      )}
+      <div
+        className={`conversation ${searching ? 'searching' : ''}`}
+        tabIndex={-1}
+        ref={scroll}
+        onContextMenu={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest('input, textarea, [contenteditable="true"]')) return;
+          event.preventDefault();
+          const selection = window.getSelection()?.toString() ?? '';
+          const message = target.closest<HTMLElement>('[data-copy-text]');
+          const block = target.closest('pre');
+          const copy = (text: string) => {
+            void copyText(text).then(
+              () => setCopyStatus('已复制'),
+              () => setCopyStatus('复制失败，请重试'),
+            );
+          };
+          setContextMenu({
+            x: event.clientX,
+            y: event.clientY,
+            items: [
+              { label: '复制选中文字', disabled: !selection, run: () => copy(selection) },
+              ...(block
+                ? [{ label: '复制此代码块', run: () => copy(block.textContent ?? '') }]
+                : []),
+              ...(message
+                ? [{ label: '复制整条消息', run: () => copy(message.dataset.copyText ?? '') }]
+                : []),
+              {
+                label: '全选对话文字',
+                run: () => {
+                  if (!transcriptRoot.current) return;
+                  const range = document.createRange();
+                  range.selectNodeContents(transcriptRoot.current);
+                  const selected = window.getSelection();
+                  selected?.removeAllRanges();
+                  selected?.addRange(range);
+                },
+              },
+              { label: '查找对话内容', separated: true, run: openFind },
+            ],
+          });
+        }}
+        onScroll={() => {
+          if (!scroll.current) return;
+          const top = scroll.current.scrollTop;
+          follow.current = scroll.current.scrollHeight - top - scroll.current.clientHeight < 80;
+          // Reading on upwards past what is loaded brings the page before it; a failed load waits for the button.
+          if (top < lastTop.current && top < 240 && !loadError) loadMore();
+          lastTop.current = top;
+        }}
+        onWheel={(event) => {
+          // A loaded page shorter than the window cannot scroll, so the wheel itself asks for more.
+          if (event.deltaY < 0 && scroll.current?.scrollTop === 0 && !loadError) loadMore();
+        }}
+      >
+        {!session ? (
+          <div className="empty-state">
+            <MessageSquare />
+            <h2>新会话</h2>
+            <button
+              type="button"
+              className="button primary"
+              disabled={!connected}
+              onClick={newSession}
+            >
+              <Plus />
+              新建会话
+            </button>
+          </div>
+        ) : (
+          <div className="transcript" ref={transcriptRoot}>
+            {loadError && (
+              <div className="history-status" role="alert">
+                {loadError}
+              </div>
+            )}
+            {history?.hasEarlier && (
+              <button
+                type="button"
+                className="history-load"
+                disabled={!connected || history.loadingEarlier || history.loading}
+                onClick={loadMore}
+              >
+                <ArrowUpToLine />
+                {history.loadingEarlier ? '加载中' : '加载更早记录'}
+              </button>
+            )}
+            {history?.loading && (
+              <div className="history-status" role="status">
+                同步会话
+              </div>
+            )}
+            {turns.length === 0 && !history?.loading && (
+              <div className="empty-state">
+                <MessageSquare />
+                <h2>{session.title}</h2>
+                <span className="empty-project">{session.projectPath}</span>
+              </div>
+            )}
+            {turns.map((turn) => (
+              <TurnView key={turn.id} turn={turn} native={native} live={live} />
+            ))}
+            {session.activeRun && background && (
+              <div className="background-tasks">
+                <div className="run-indicator" role="status">
+                  <span className="running-dot" />
+                  后台任务{tasks.length ? ` ${tasks.length} 个` : ''} · Claude
+                  已答完，任务结束后会接着处理
+                  {!ownsRun && ' · 另一连接'}
+                </div>
+                <ul>
+                  {tasks.map((task) => (
+                    <li key={task.id}>
+                      <span>{task.description || task.kind}</span>
+                      <button
+                        type="button"
+                        className="button"
+                        disabled={!connected || !ownsRun || busy}
+                        onClick={() => stopTask(task.id)}
+                      >
+                        结束
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                {tasks.length !== 1 && (
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={!connected || !ownsRun || busy}
+                    onClick={stop}
+                  >
+                    全部结束
+                  </button>
+                )}
+              </div>
+            )}
+            {session.activeRun && !background && (
+              <div className="run-indicator" role="status">
+                <span className="running-dot" />
+                {session.activeRun.status !== 'awaiting_approval'
+                  ? '运行中'
+                  : session.activeRun.waiting === 'question'
+                    ? '等待回答'
+                    : '等待审批'}
+                {!ownsRun && ' · 另一连接'}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      {contextMenu && (
+        <Menu label="对话文字操作" {...contextMenu} onClose={() => setContextMenu(null)} />
+      )}
+    </SearchExpanded.Provider>
   );
 }

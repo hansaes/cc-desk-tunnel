@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Check, Plus, Trash2 } from 'lucide-react';
 import type { Session } from '@cc-desk-tunnel/protocol';
+import { folderName } from './paths.ts';
 import { Modal } from './ui.tsx';
 
 // The dialogs share the window's busy flag and error line, so a failed request stays visible in the open dialog.
@@ -12,11 +13,13 @@ export function AddProjectDialog({
   error,
   close,
   add,
-}: DialogProps & { add: (path: string) => void }) {
+  title = '添加项目',
+  action = '添加',
+}: DialogProps & { add: (path: string) => void; title?: string; action?: string }) {
   const [path, setPath] = useState('');
   return (
     <Modal
-      title="添加项目"
+      title={title}
       onClose={() => {
         if (!busy) close();
       }}
@@ -50,7 +53,7 @@ export function AddProjectDialog({
           </button>
           <button className="button primary" disabled={busy || !connected}>
             <Plus />
-            添加
+            {action}
           </button>
         </div>
       </form>
@@ -153,6 +156,54 @@ export function RenameSessionDialog({
             取消
           </button>
           <button className="button primary" disabled={busy || !connected}>
+            <Check />
+            保存
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+export function RenameProjectDialog({
+  path,
+  name: current,
+  close,
+  rename,
+}: {
+  path: string;
+  name: string;
+  close: () => void;
+  rename: (name: string) => void;
+}) {
+  const [name, setName] = useState(current);
+  return (
+    <Modal title="项目显示名称" onClose={close}>
+      <form
+        className="dialog-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          rename(name.trim());
+        }}
+      >
+        <label>
+          显示名称
+          <input
+            autoFocus
+            maxLength={60}
+            value={name}
+            placeholder={folderName(path)}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+        <p className="muted">
+          只改变这台电脑上列表里的名字，不改动文件夹 <code>{path}</code>；留空恢复文件夹名。
+        </p>
+        <div className="dialog-actions">
+          <button type="button" className="button secondary" onClick={close}>
+            取消
+          </button>
+          <button className="button primary">
             <Check />
             保存
           </button>

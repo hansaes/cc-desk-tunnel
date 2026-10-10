@@ -7,8 +7,10 @@ import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
-import { startWindowsTunnel } from './windows-tunnel.mjs';
+import { startWindowsSsh } from './windows-ssh.mjs';
+import { openChannels } from './tunnel-channels.mjs';
 import { httpProxy, openSocket } from './system-proxy.mjs';
+import { channelFailure, controlFailure } from './connect-errors.mjs';
 
 export function certificateMatches(observed, trusted) {
   if (typeof trusted !== 'string' || typeof observed !== 'string') return false;
@@ -21,13 +23,27 @@ export function controlTlsOptions(config) {
     throw new Error('请输入可信安装信息中的 SHA256 证书指纹，或留空使用 CA 验证。');
   return { rejectUnauthorized: false };
 }
+// The waits of connecting, in milliseconds. Whatever is not a sensible number of seconds takes the default, and
+// the whole is never shorter than the local SSH service is given plus the rest of the way.
+export function connectionWaits(values) {
+  const wait = (seconds, fallback) =>
+    (Number.isInteger(seconds) && seconds >= 5 && seconds <= 600 ? seconds : fallback) * 1000;
+  const ssh = wait(values?.ssh, 10);
+  return {
+    connect: wait(values?.connect, 15),
+    ssh,
+    ready: Math.max(wait(values?.ready, 45), ssh + 35000),
+  };
+}
 // Starts TLS with the service, through the system's HTTP proxy when the Windows settings name one for it. The proxy
 // only relays bytes: the certificate is still the service's own and is judged as on a direct connection.
-async function connectService(address, config, resolveProxy) {
+// `route`, when given, is told the proxy that was used, for the words of a failure.
+async function connectService(address, config, resolveProxy, route) {
   const port = Number(address.port || 443);
   const proxy = httpProxy(await resolveProxy?.(`https://${address.hostname}:${port}`));
+  if (route) route.proxy = proxy;
   return connect({
-    socket: await openSocket(proxy, address.hostname, port),
+    socket: await openSocket(proxy, address.hostname, port, connectionWaits(config.waits).connect),
     servername: isIP(address.hostname) ? undefined : address.hostname,
     ...controlTlsOptions(config),
   });
@@ -79,6 +95,7 @@ export async function openProxyBridge(
     throw new Error('原生模式需要不含凭据的 WSS 地址。');
   // A malformed pin is refused here, before anything listens or connects.
   controlTlsOptions(config);
+  const waits = connectionWaits(config.waits);
   const nonce = randomBytes(32).toString('hex');
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
@@ -102,22 +119,79 @@ export async function openProxyBridge(
   });
   wss.on('connection', (local) => {
     // CA verification completes at TLS handshake; explicit pins are checked before sending credentials.
+    const route = { proxy: null };
     const remote = new WebSocket(address, {
       // Node's HTTP client also takes the connection through this callback once it is ready.
       createConnection: (_options, created) => {
-        connectService(address, config, binaries.resolveProxy).then(
+        connectService(address, config, binaries.resolveProxy, route).then(
           (socket) => created(null, socket),
           created,
         );
       },
     });
-    pair = { local, remote, controller: new AbortController(), tunnel: null, preparing: null };
+    pair = {
+      local,
+      remote,
+      controller: new AbortController(),
+      ssh: null,
+      channels: null,
+      preparing: null,
+    };
     const current = pair;
     const queue = [];
     let verified = false;
     let nativeReady;
-    let configurationReceived = false;
-    const timer = setTimeout(() => fail('Windows SSH 连接准备超时。'), 45000);
+    let offerReceived = false;
+    const target = `${address.hostname}:${address.port || 443}`;
+    const timer = setTimeout(
+      () =>
+        fail(
+          offerReceived
+            ? channelFailure(waits.ready / 1000, current.channels?.lastError, target, route.proxy)
+            : `服务端在 ${waits.ready / 1000} 秒内没有完成应答。\n请检查网络是否稳定，或稍后重试；反复出现时查看服务端日志。`,
+        ),
+      waits.ready,
+    );
+    // One more connection to the service, for one SSH connection. It is checked like the control connection
+    // before anything is sent on it.
+    function dialChannel() {
+      return new Promise((resolve, reject) => {
+        const channel = new WebSocket(address, {
+          handshakeTimeout: waits.connect,
+          // SSH traffic is already encrypted and does not compress.
+          perMessageDeflate: false,
+          createConnection: (_options, created) => {
+            connectService(address, config, binaries.resolveProxy).then(
+              (socket) => created(null, socket),
+              created,
+            );
+          },
+        });
+        channel.once('error', (error) => {
+          channel.terminate();
+          reject(error);
+        });
+        channel.once('open', () => {
+          if (
+            config.fingerprint &&
+            !certificateMatches(
+              channel._socket.getPeerCertificate().fingerprint256,
+              config.fingerprint,
+            )
+          ) {
+            channel.terminate();
+            reject(
+              Object.assign(
+                new Error(
+                  '执行通道连到的服务证书指纹不匹配；未发送任何凭据。\n控制连接校验通过之后，同一地址应答了另一张证书：请确认服务地址没有被劫持或指向多台服务器。',
+                ),
+                { fatal: true },
+              ),
+            );
+          } else resolve(channel);
+        });
+      });
+    }
     function fail(message) {
       if (local.readyState === WebSocket.OPEN)
         local.send(JSON.stringify({ type: 'connection.error', code: 'tunnel_failed', message }));
@@ -129,7 +203,9 @@ export async function openProxyBridge(
         config.fingerprint &&
         !certificateMatches(remote._socket.getPeerCertificate().fingerprint256, config.fingerprint)
       ) {
-        fail('服务证书指纹不匹配；未发送服务凭据。');
+        fail(
+          '服务证书指纹不匹配；未发送服务凭据。\n请核对“服务证书指纹”是否与安装时给出的一致；服务端更换过证书后需要填新的指纹。若两者都没变，说明连到的不是你的服务器。',
+        );
         return;
       }
       verified = true;
@@ -155,33 +231,40 @@ export async function openProxyBridge(
       try {
         message = serverMessageSchema.parse(JSON.parse(raw.toString('utf8')));
       } catch {
-        fail('服务协议不兼容。');
+        fail('服务端的消息无法识别。\n客户端与服务端的版本可能不一致，请把两者升级到同一版本。');
         return;
       }
       // A service of another version refuses the connection but may still offer the installer for its own.
       if (message.type === 'connection.error' && message.client) release = message.client;
-      if (message.type === 'tunnel.configure') {
-        if (
-          configurationReceived ||
-          !nativeReady ||
-          nativeReady.connectionId !== message.connectionId
-        ) {
+      if (message.type === 'tunnel.offer') {
+        if (offerReceived || !nativeReady || nativeReady.connectionId !== message.connectionId) {
           fail('隧道连接标识不匹配。');
           return;
         }
-        configurationReceived = true;
-        current.preparing = startWindowsTunnel(message, binaries, current.controller.signal, fail)
-          .then((tunnel) => {
-            current.tunnel = tunnel;
-            if (!closed && remote.readyState === WebSocket.OPEN)
-              remote.send(JSON.stringify(tunnel.credentials));
+        offerReceived = true;
+        current.preparing = startWindowsSsh(
+          message.connectionId,
+          binaries,
+          current.controller.signal,
+          fail,
+          waits.ssh,
+        )
+          .then((ssh) => {
+            current.ssh = ssh;
+            if (closed || remote.readyState !== WebSocket.OPEN) return;
+            current.channels = openChannels(message, ssh.port, dialChannel, fail);
+            remote.send(JSON.stringify(ssh.credentials));
           })
           .catch((error) => fail(error.message));
+      } else if (message.type === 'tunnel.open') {
+        // Only ever follows the credentials, which are sent once the channels can be opened.
+        if (message.connectionId === nativeReady?.connectionId)
+          current.channels?.open(message.channelId);
       } else if (message.type === 'ready' && message.adapter === 'claude-code') {
         nativeReady = message;
         release = message.client;
       } else if (message.type === 'tunnel.ready') {
-        if (!configurationReceived || message.connectionId !== nativeReady?.connectionId) {
+        if (!offerReceived || message.connectionId !== nativeReady?.connectionId) {
           fail('隧道就绪标识不匹配。');
           return;
         }
@@ -199,11 +282,11 @@ export async function openProxyBridge(
       });
       socket.on('error', (error) =>
         fail(
-          error.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH'
-            ? '会话历史超过 WebSocket 接收上限。'
-            : /\b429\b/.test(error.message)
-              ? '登录失败次数过多，服务端已暂时拒绝本机，请稍后再试。'
-              : '代理连接失败，请检查服务地址和网络。',
+          controlFailure(
+            error,
+            `${address.hostname}:${address.port || 443}`,
+            socket === remote ? route.proxy : null,
+          ),
         ),
       );
     }
@@ -216,7 +299,8 @@ export async function openProxyBridge(
       pair?.local.close();
       pair?.remote.terminate();
       await pair?.preparing;
-      await pair?.tunnel?.close();
+      pair?.channels?.close();
+      await pair?.ssh?.close();
       for (const socket of wss.clients) socket.terminate();
       await new Promise((resolve) => wss.close(resolve));
       await new Promise((resolve) => server.close(resolve));
