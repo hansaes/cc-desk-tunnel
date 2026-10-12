@@ -48,7 +48,7 @@ Claude Code（简称 CC）运行在一台 Linux 服务器上；项目代码、�
 
 ## 快速开始
 
-需要：一台有公网 IP 或域名的 Linux 服务器（x86_64，推荐 Ubuntu，已安装 Docker），和一台 Windows 10 / 11 x64 电脑。
+需要：一台有公网 IP 或域名的 Linux 服务器（x86_64；arm64 为实验性支持。推荐 Ubuntu，已安装 Docker），和一台 Windows 10 / 11 x64 电脑。macOS 与 Linux 上也有客户端，目前是实验性支持。
 
 **服务器不需要高配。** 编译、测试和各种开发工具都在 Windows 本机运行，服务器上只有 Claude Code 和一个轻量的代理服务，2 核 1 GB 内存的入门机型就能运行。只有打算让 Claude 直接在服务器上编译或跑重负载时，才需要按那些任务选配置。
 
@@ -74,6 +74,8 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 从[发布页](https://github.com/sun168567/cc-desk-tunnel/releases/latest)下载 `CC-Desk-Tunnel-Setup-<版本>-x64.exe` 并安装。安装包自带 PowerShell 7 和 OpenSSH，不需要另装任何东西。启动后填入上一步的三项信息并连接。
 
 首次运行会遇到 SmartScreen 提示，处理方法见[杀毒软件与 SmartScreen](#杀毒软件与-smartscreen)。
+
+macOS 与 Linux 的安装包在同一个发布页，安装方法见 [macOS 客户端](docs/macos.md)与 [Linux 客户端](docs/linux.md)。它们是实验性支持，没有签名，升级时需要重新下载安装。
 
 ### 3. 登录 Claude
 
@@ -138,9 +140,24 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 | 执行通道没有就绪 | 凭据已通过，本机 SSH 服务已启动，服务端经执行通道连不回本机 | 提示里带有具体原因时按它处理；经反向代理或系统代理连接时，确认它允许同一地址同时有多条连接 |
 | 服务端经隧道连不上本机的 SSH 服务 | 执行通道已建立，探测命令没有应答 | 检查安全软件是否拦截了内置的 `sshd.exe` 或 PowerShell |
 
+### 用着用着断开时
+
+连接断了不需要做什么：客户端留在原来的界面自己重连，一直试到连上为止，连上之后补上期间的内容。正在进行的任务在服务端继续跑；只有断开那一刻正在电脑上执行的那条命令会失败，Claude 会看到并自行处理，之后的命令等电脑连回来再执行。
+
+电脑离线超过 5 分钟（服务端的 `PROXY_GRACE_SECONDS` 可改）任务才会停下。此时回到会话，点输入框右下角的“继续”就能接着做，不必再写一句话；手动停止的任务也一样。主动点“断开连接”或退出客户端，任务立即结束。
+
+客户端每 15 秒确认一次服务端还在，约 45 秒没有任何回应就判定连接已断；服务端对客户端也是一样。只有服务端明确拒绝（凭据不对、版本不一致）时才会回到登录页。
+
+要查是哪一段断的，对照两边的记录：
+
+- **客户端**：“设置 → 关于与更新 → 打开日志文件夹”里的 `client.log`，每次连接记着何时建立、何时断开、是窗口还是服务端一侧先断开，以及原因。不含凭据、对话和命令内容。
+- **服务端**：`sudo docker logs <容器名> 2>&1 | grep Connection`，每条连接记着是哪台电脑、从哪个地址来、保持了多久、怎样结束的。`no heartbeat answer for 45s` 是服务端等不到客户端的回应；`code 1006` 是对方没有打招呼就断了，多半出在途中的网络、代理或反向代理。
+
+经代理或反向代理连接时，确认它不会掐断长时间没有多少数据的连接；nginx 的写法见[用 nginx 反代](deploy/nginx.md)。
+
 ## 使用边界
 
-- **单用户自用。** 一个服务对应一个使用者、同一时间一台在线的 Windows 设备。没有多用户、权限分级或租户隔离，也不打算做。
+- **单用户自用。** 一个服务对应一个使用者；这个人可以同时连接自己的几台电脑，每个会话在它的项目目录所在的那台上运行。没有多用户、权限分级或租户隔离，也不打算做。
 - **不改官方本体，不做对抗。** 不含任何针对风控或检测的规避设计，也不以突破服务的地区限制为目的。
 
 ## 文档
@@ -153,6 +170,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-t
 | [架构](docs/architecture.md) | 组成、连接建立过程、关键设计决定 |
 | [原生运行与会话存储](docs/native-runtime.md) | 如何驱动官方 CLI、上下文归属、审批、保留期 |
 | [Windows 客户端](apps/desktop/README.md) · [Linux 服务](apps/server/README.md) · [消息契约](packages/protocol/README.md) | 各模块的实现说明 |
+| [macOS 客户端（实验性）](docs/macos.md) · [Linux 客户端（实验性）](docs/linux.md) | 安装、与 Windows 的不同、已验证与未验证 |
 | [路线与现状](docs/roadmap.md) · [变更记录](CHANGELOG.md) | 已完成、待验证、计划；各版本的变化 |
 | [开发约定](docs/development.md) | 分支、提交、检查、发布 |
 

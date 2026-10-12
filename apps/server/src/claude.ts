@@ -2,11 +2,28 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import type { Query, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { Effort, EventPayload, NativeMetrics, PermissionMode } from '@cc-desk-tunnel/protocol';
+import type {
+  DevicePlatform,
+  Effort,
+  EventPayload,
+  NativeMetrics,
+  PermissionMode,
+} from '@cc-desk-tunnel/protocol';
+import { deviceTerms } from './device-terms.ts';
 import { ClaudeStream } from './claude-stream.ts';
 import type { SshConnection } from './tunnel.ts';
 import { nativeCapabilities, nativeContextRefresh, nativeMetrics } from './native-controls.ts';
 import type { NativeInput } from './native-input.ts';
+import { readNativeSettings } from './native-settings.ts';
+
+// Whether reasoning summaries are asked for. A settings file that cannot be read leaves them on.
+function thinkingShown() {
+  try {
+    return readNativeSettings().showThinkingSummaries !== false;
+  } catch {
+    return true;
+  }
+}
 
 export type ClaudeOptions = {
   executable: string;
@@ -22,6 +39,8 @@ export type ClaudeRun = {
   // The session whose Linux directory holds this session's native history; itself unless it is a fork.
   nativeRoot: string;
   projectPath: string;
+  // The system of the device, as the session's prompt has it.
+  platform: DevicePlatform;
   permissionMode: PermissionMode;
   model?: string | null;
   effort?: Effort | null;
@@ -43,23 +62,23 @@ export type ClaudeRun = {
   controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 // `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
-export function remotePrompt(projectPath: string, ssh: SshConnection, sessionId: string) {
+export function remotePrompt(
+  projectPath: string,
+  ssh: SshConnection,
+  sessionId: string,
+  platform: DevicePlatform = 'win32',
+) {
+  const terms = deviceTerms(platform, projectPath);
   return [
-    'The user and all their projects are on the connected Windows computer, NOT on this Linux host.',
-    `Windows project cwd: ${JSON.stringify(projectPath)}. Shell: PowerShell 7. Encoding: UTF-8.`,
-    `Use your native Bash tool to run standard OpenSSH: ssh -F ${JSON.stringify(ssh.configPath)} windows '<remote command>'.`,
-    `The SSH configuration contains the loopback endpoint, identity and pinned host key. Do not print, read into conversation, or copy the private key.`,
-    `PowerShell executable on Windows: ${JSON.stringify(ssh.powershellPath)}.`,
-    'The SSH login command is parsed by cmd.exe, not PowerShell. Invoke the quoted PowerShell executable directly; do not prefix it with the PowerShell & operator.',
-    'For robust quoting, encode a PowerShell script as UTF-16LE Base64 on Linux and pass -NoLogo -NoProfile -NonInteractive -EncodedCommand to that executable over SSH.',
-    `Begin project scripts with Set-Location -LiteralPath '${projectPath.replaceAll("'", "''")}'; use UTF-8 for console and file I/O.`,
-    'Use SSH for all user project reads, edits, searches and commands. Do not operate user projects with Linux Read/Edit tools.',
-    'This Linux host only runs Claude Code, proxy state and temporary attachments. There is no copy of the Windows project here.',
-    'Never silently fall back to Linux when Windows is unavailable. Report unknown results after interruption; do not automatically retry side effects.',
-    "Each SSH command is its own session and several may run concurrently. Windows processes started by a command are terminated when that command's SSH session ends, so detaching on Windows does not keep them alive.",
-    'For a long-running Windows process such as a dev server or watcher, keep its SSH command running as a background Bash task and end that task to stop it.',
-    'A remote command that blocks holds the turn until its Bash timeout. Set a timeout sized to the work, and run anything that may wait indefinitely as a background Bash task.',
-    `The desktop client on Windows sends scheduled prompts by itself. When the user asks for a scheduled or recurring task, edit %APPDATA%\\CC Desk Tunnel\\schedules.json on Windows (UTF-8 JSON; its "说明" field documents the format; changes apply within seconds) rather than using cron tools on this host, which stop when the run ends. This session's ID for a task that continues it: ${sessionId}.`,
+    "The user's projects are on their own computer, the device, NOT on this Linux host, which only runs Claude Code and has no copy of them.",
+    `Device: ${terms.name}. Project directory: ${JSON.stringify(projectPath)}.`,
+    `Do all project reads, edits, searches and commands on the device with your native Bash tool over SSH, with the configuration ${JSON.stringify(ssh.configPath)}. Do not use this host's Read/Edit tools on project files, and do not print, read into conversation or copy the key the configuration names.`,
+    `Send a script on standard input, as a quoted Bash here-document: ssh -F ${JSON.stringify(ssh.configPath)} device-script <<'PS' ... PS. ${terms.script}`,
+    `device-script is the host device with one fixed command, which the configuration shows as RemoteCommand, and takes none of its own. ${terms.command}`,
+    'If the device is unreachable, say so; never fall back to this host. After an interruption report results as unknown; do not repeat side effects on your own.',
+    'To look at a picture on the device, such as a pasted screenshot or an attached image, copy that one file with scp to a temporary file on this host, open it with the Read tool, and delete the copy afterwards. That is the only use of Read on this host for a file from the device.',
+    'Commands may run concurrently. One that blocks holds the turn until its Bash timeout: size the timeout to the work, and run anything long-lived, such as a dev server or watcher, as a background Bash task. Do not count on a process outliving the ssh command that started it, nor on ending the command to stop it: keep the command running for as long as the process is needed, and stop the process itself on the device.',
+    `Scheduled and recurring prompts are sent by the desktop client, not by cron on this host: edit the UTF-8 JSON file whose path is in the device's CC_DESK_TUNNEL_SCHEDULES environment variable (its "说明" field documents the format; changes apply within seconds). This session's ID for a task that continues it: ${sessionId}.`,
   ].join('\n');
 }
 
@@ -117,19 +136,21 @@ export async function runClaude(
         abortController,
         includePartialMessages: true,
         permissionMode: run.permissionMode,
+        // The SDK takes the mode that asks about nothing only with this said as well.
+        allowDangerouslySkipPermissions: run.permissionMode === 'bypassPermissions',
         persistSession: true,
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: remotePrompt(run.projectPath, run.ssh, run.sessionId),
+          append: remotePrompt(run.projectPath, run.ssh, run.sessionId, run.platform),
           snapshot: false,
         },
         ...(run.resume ? { resume: run.sessionId } : { sessionId: run.sessionId }),
         model: run.model ?? options.model,
         effort: run.effort ?? undefined,
         // Newer models return no reasoning text unless a summary is asked for; headless runs ignore the
-        // showThinkingSummaries setting, so this is the only switch.
-        extraArgs: { 'thinking-display': 'summarized' },
+        // showThinkingSummaries setting, so this is the only switch. It follows that setting.
+        extraArgs: thinkingShown() ? { 'thinking-display': 'summarized' } : {},
         settings: options.settingsPath,
         settingSources: ['user', 'project', 'local'],
         maxTurns: options.maxTurns,
@@ -149,8 +170,8 @@ export async function runClaude(
             return {
               behavior: 'deny',
               message: question
-                ? 'The Windows user declined to answer.'
-                : 'The Windows user denied or cancelled this request.',
+                ? 'The user declined to answer.'
+                : 'The user denied or cancelled this request.',
             };
           // The official tool takes the user's choices as `answers`, keyed by question text.
           return {
@@ -294,7 +315,7 @@ export async function runClaude(
         toolId: tool.id,
         status: 'unknown',
         output:
-          '运行结束；该工具最终执行结果未确认。已发出的 Windows SSH 命令可能继续执行，副作用未撤销，不能自动重放。',
+          '运行结束；该工具最终执行结果未确认。已发出的 SSH 命令可能继续执行，副作用未撤销，不能自动重放。',
         exitCode: null,
       });
     }

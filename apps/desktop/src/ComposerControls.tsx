@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { ArrowLeft, ChevronDown, ChevronRight, CircleGauge, Check, RotateCcw } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronRight, Check, RotateCcw } from 'lucide-react';
 import type {
   Effort,
   NativeCapabilities,
@@ -75,6 +75,15 @@ export default function ComposerControls({
   const shownEffort = preview ?? effort ?? actual;
   const label = chosen?.displayName ?? model ?? '原生默认';
   const context = metrics?.context;
+  // How full the window is, drawn as a ring that changes colour as it runs out.
+  const contextUsed = context ? Math.min(100, Math.max(0, context.percentage)) : 0;
+  const contextLevel = !context
+    ? 'unknown'
+    : contextUsed >= 90
+      ? 'full'
+      : contextUsed >= 70
+        ? 'high'
+        : 'ok';
   async function saveEffort() {
     dragging.current = false;
     if (!commitPending.current || disabled) return;
@@ -108,9 +117,17 @@ export default function ComposerControls({
           onBlur={() => setContextOpen(false)}
           onClick={() => setContextOpen(true)}
         >
-          <CircleGauge
-            style={{ color: context && context.percentage > 80 ? '#b68022' : undefined }}
-          />
+          <svg className={`context-ring ${contextLevel}`} viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="7.5" pathLength={100} />
+            <circle
+              className="context-ring-used"
+              cx="10"
+              cy="10"
+              r="7.5"
+              pathLength={100}
+              strokeDasharray={`${contextUsed} 100`}
+            />
+          </svg>
         </button>
         {contextOpen && (
           <div className="context-tooltip" role="tooltip">
@@ -172,7 +189,9 @@ export default function ComposerControls({
                 <input
                   style={
                     {
-                      '--fill': `${(Math.max(0, levels.indexOf(shownEffort ?? 'high')) / Math.max(1, levels.length - 1)) * 100}%`,
+                      '--fill': shownEffort
+                        ? `${(Math.max(0, levels.indexOf(shownEffort)) / Math.max(1, levels.length - 1)) * 100}%`
+                        : '0%',
                     } as CSSProperties
                   }
                   aria-label="推理强度"
@@ -182,8 +201,14 @@ export default function ComposerControls({
                   max={levels.length - 1}
                   aria-valuetext={shownEffort ? effortNames[shownEffort] : '原生默认'}
                   value={Math.max(0, levels.indexOf(shownEffort ?? 'high'))}
+                  data-unset={shownEffort ? undefined : ''}
                   onPointerDown={(event) => {
                     dragging.current = true;
+                    // Unset: the handle is hidden, so pressing where it would be picks that level; dragging or a press elsewhere overrides it.
+                    if (!shownEffort) {
+                      setPreview(levels[Number(event.currentTarget.value)]);
+                      commitPending.current = true;
+                    }
                     event.currentTarget.setPointerCapture(event.pointerId);
                   }}
                   onChange={(event) => {
@@ -217,6 +242,27 @@ export default function ComposerControls({
                     if (!dragging.current) void saveEffort();
                   }}
                 />
+              )}
+              {levels.length > 0 && (
+                <div className="effort-ticks">
+                  {levels.map((level, index) => (
+                    <button
+                      key={level}
+                      type="button"
+                      tabIndex={-1}
+                      disabled={disabled}
+                      className={level === shownEffort ? 'current' : undefined}
+                      style={
+                        {
+                          '--at': index / Math.max(1, levels.length - 1),
+                        } as CSSProperties
+                      }
+                      onClick={() => void configure({ effort: level })}
+                    >
+                      {effortNames[level]}
+                    </button>
+                  ))}
+                </div>
               )}
             </div>
             {choosing && (

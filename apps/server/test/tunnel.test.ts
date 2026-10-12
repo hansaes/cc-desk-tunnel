@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { sshConfig, sessionSsh, Tunnel } from '../src/tunnel.ts';
+import { Door, SCRIPT_COMMAND, sshConfig, sessionSsh, Tunnel } from '../src/tunnel.ts';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -79,27 +79,58 @@ function collect(socket: Socket) {
 
 test('SSH config pins loopback target and host key, disallows interactive/agent forwarding', () => {
   const files = sshConfig('/tmp/private', 32123, 'user', 'ssh-ed25519 AAAATEST');
+  assert.match(files.config, /^Host device windows device-script$/m);
+  // The name that takes a script: the same computer with the command fixed, its variable kept from `ssh`.
+  assert.match(
+    files.config,
+    /^Host device-script\n  RemoteCommand "%%CC_DESK_TUNNEL_PWSH%%" .*\n  RequestTTY no$/m,
+  );
   assert.match(files.config, /HostName 127\.0\.0\.1/);
   assert.match(files.config, /StrictHostKeyChecking yes/);
   assert.match(files.config, /BatchMode yes/);
   assert.match(files.config, /ForwardAgent no/);
   assert.equal(files.knownHosts, '[127.0.0.1]:32123 ssh-ed25519 AAAATEST\n');
 });
+test('commands share one SSH connection where the platform and the length of the path allow it', () => {
+  const config = (directory: string, platform: NodeJS.Platform) =>
+    sshConfig(directory, 32123, 'user', 'ssh-ed25519 AAAATEST', platform).config;
+  const shared = config('/data/state/connections/0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11', 'linux');
+  assert.match(shared, /ControlMaster auto/);
+  assert.match(shared, /ControlPath ".*0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11[\\/]mux"/);
+  assert.match(shared, /ControlPersist \d+/);
+  assert.doesNotMatch(config('/tmp/private', 'win32'), /Control/);
+  assert.doesNotMatch(config(`/srv/${'long-name/'.repeat(9)}connections/id`, 'linux'), /Control/);
+});
 test('context references native SSH configuration without inventing execution tools', () => {
   const prompt = remotePrompt(
     "D:\\中文 空格\\it's",
-    {
-      configPath: '/private/ssh_config',
-      powershellPath: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
-    },
+    { configPath: '/private/ssh_config' },
     '0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11',
   );
-  assert.match(prompt, /%APPDATA%\\CC Desk Tunnel\\schedules\.json/);
+  // Scripts travel on standard input to a host of the configuration: nothing of the device's command line,
+  // and no encoding, is for the model to write.
+  assert.match(prompt, /ssh -F "\/private\/ssh_config" device-script <<'PS'/);
+  assert.doesNotMatch(prompt, /EncodedCommand|CC_DESK_TUNNEL_PWSH|ReadToEnd/);
+  assert.match(prompt, /The host device runs a command line as it is/);
+  // The path given for scp is the project's own: an example on another drive was taken for the drive to use.
+  assert.match(
+    prompt,
+    /scp or sftp, where a Windows path takes forward slashes: the project directory is "device:D:\/中文 空格\/it's"/,
+  );
+  assert.match(prompt, /CC_DESK_TUNNEL_SCHEDULES/);
+  // Nothing of the device's own layout: where its programs and the client's files are is the device's to know.
+  assert.doesNotMatch(prompt, /pwsh\.exe|APPDATA/);
   assert.match(prompt, /0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11/);
   assert.match(prompt, /native Bash/);
   assert.match(prompt, /ssh -F/);
   assert.match(prompt, /it''s/);
   assert.doesNotMatch(prompt, /mcp__/);
+});
+test('the fixed script command survives the double quotes of cmd.exe', () => {
+  // What follows -Command is wrapped in double quotes and holds neither kind of quote itself.
+  const body = SCRIPT_COMMAND.slice(SCRIPT_COMMAND.indexOf('-Command "') + 10, -1);
+  assert.doesNotMatch(body, /["']/);
+  assert.match(body, /ReadToEnd\(\)/);
 });
 test('a session keeps one SSH path, and so one system prompt, across reconnects', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'claude-session-ssh-'));
@@ -107,16 +138,15 @@ test('a session keeps one SSH path, and so one system prompt, across reconnects'
   const session = '0d0c6a0e-6a53-4a0c-9d3a-2f6f5f3f7b11';
   const prompts = ['first', 'second'].map((connection) => {
     const configPath = join(directory, 'connections', connection, 'ssh_config');
-    const ssh = sessionSsh(directory, session, { configPath, powershellPath: 'pwsh.exe' });
+    const ssh = sessionSsh(directory, session, { configPath });
     assert.equal(readFileSync(ssh.configPath, 'utf8'), `Include ${JSON.stringify(configPath)}\n`);
     return remotePrompt('D:\\work', ssh, session);
   });
   assert.equal(prompts[0], prompts[1]);
   assert.doesNotMatch(prompts[0]!, /connections/);
   assert.notEqual(
-    sessionSsh(directory, randomUUID(), { configPath: '/x', powershellPath: 'pwsh.exe' })
-      .configPath,
-    sessionSsh(directory, session, { configPath: '/x', powershellPath: 'pwsh.exe' }).configPath,
+    sessionSsh(directory, randomUUID(), { configPath: '/x' }).configPath,
+    sessionSsh(directory, session, { configPath: '/x' }).configPath,
   );
 });
 test('the tunnel offers a secret of its own and compares it without leaking its length', async (t) => {
@@ -293,4 +323,100 @@ test('closing the tunnel ends waiting and joined SSH connections, their channels
   assert.equal(device.unexpected(), 0);
   // Closing twice is the same close.
   assert.equal(device.tunnel.close(), device.tunnel.close());
+});
+
+test('a device keeps one door: commands begun while it is away wait for its next tunnel, whose keys replace the old', async (t) => {
+  const first = await harness(t);
+  const directory = mkdtempSync(join(tmpdir(), 'claude-door-'));
+  const door = new Door({ holdMs: 400 }, directory, randomUUID());
+  await door.start();
+  t.after(async () => {
+    await door.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const credentials = (name: string) => ({
+    type: 'tunnel.credentials' as const,
+    connectionId: randomUUID(),
+    username: 'tester',
+    hostPublicKey: `ssh-ed25519 ${name}`,
+    privateKey: `private ${name}\n`,
+  });
+  first.tunnel.credentials = credentials('first');
+  door.use(first.tunnel);
+  const configPath = door.ssh!.configPath;
+  const config = readFileSync(configPath, 'utf8');
+  const port = Number(/Port (\d+)/.exec(config)![1]);
+  assert.notEqual(port, first.tunnel.port);
+  assert.match(config, /ConnectTimeout 16\b/);
+  assert.match(readFileSync(join(door.directory, 'known_hosts'), 'utf8'), /first/);
+
+  // Through the door the connection is the tunnel's like any other.
+  const through = connect(port, '127.0.0.1');
+  const [channelId] = await first.requested(1);
+  const { device } = await first.open(channelId);
+  through.write('ping');
+  assert.equal((await once(device, 'message'))[0].toString(), 'ping');
+  through.destroy();
+
+  // The device goes: what is begun now is held, and goes to the tunnel that comes next.
+  door.use(undefined);
+  const waiting = connect(port, '127.0.0.1');
+  await once(waiting, 'connect');
+  await delay(50);
+  assert.equal(first.requests.length, 1);
+  const second = await harness(t);
+  second.tunnel.credentials = credentials('second');
+  door.use(second.tunnel);
+  assert.equal(door.ssh!.configPath, configPath);
+  assert.match(readFileSync(join(door.directory, 'known_hosts'), 'utf8'), /second/);
+  assert.equal(readFileSync(join(door.directory, 'identity'), 'utf8'), 'private second\n');
+  const [next] = await second.requested(1);
+  const joined = await second.open(next);
+  waiting.write('late');
+  assert.equal((await once(joined.device, 'message'))[0].toString(), 'late');
+  waiting.destroy();
+
+  // Nobody comes back: the wait ends.
+  door.use(undefined);
+  const lost = connect(port, '127.0.0.1');
+  await once(lost, 'connect');
+  const began = Date.now();
+  await closed(lost);
+  assert.ok(Date.now() - began >= 300);
+});
+test('the prompt lets the model look at a picture of the device by copying that one file here', () => {
+  const prompt = remotePrompt('D:\\work', { configPath: '/private/ssh_config' }, 'session');
+  assert.match(prompt, /copy that one file with scp to a temporary file on this host/);
+  assert.match(prompt, /Do not use this host's Read\/Edit tools on project files/);
+});
+
+test('a device with a POSIX shell gets a script command and a prompt of its own', () => {
+  const files = sshConfig(
+    '/tmp/private',
+    32123,
+    'device',
+    'ssh-ed25519 AAAATEST',
+    'linux',
+    15,
+    'darwin',
+  );
+  assert.match(files.config, /\n {2}RemoteCommand exec "\$CC_DESK_TUNNEL_SHELL" -s\n/);
+  assert.doesNotMatch(files.config, /CC_DESK_TUNNEL_PWSH/);
+  const ssh = { configPath: '/private/ssh_config' };
+  const prompt = remotePrompt("/Users/me/my project/it's", ssh, 'session', 'darwin');
+  assert.match(prompt, /Device: macOS\. Project directory: "\/Users\/me\/my project\/it's"\./);
+  assert.match(prompt, /ssh -F "\/private\/ssh_config" device-script <<'PS'/);
+  assert.match(prompt, /Begin it with cd -- '\/Users\/me\/my project\/it'\\''s'\./);
+  assert.match(prompt, /the project directory is "device:\/Users\/me\/my project\/it's"/);
+  assert.doesNotMatch(prompt, /PowerShell|cmd\.exe|Windows|Set-Location/);
+  // Everything that does not depend on the system reads the same on both, line for line.
+  const windows = remotePrompt('D:\\work', ssh, 'session').split('\n');
+  const mac = remotePrompt('/work', ssh, 'session', 'darwin').split('\n');
+  assert.equal(windows.length, mac.length);
+  assert.deepEqual(
+    windows.flatMap((line, index) => (line === mac[index] ? [] : [index])),
+    [1, 3, 4],
+  );
+  // No system named is Windows, as it was before others were supported.
+  assert.equal(remotePrompt('D:\\work', ssh, 'session', 'win32'), windows.join('\n'));
 });

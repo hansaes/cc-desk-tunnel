@@ -67,7 +67,7 @@ const sections: { id: Section; name: string; group: string; icon: typeof Bell; w
     name: '关于与更新',
     group: '其他',
     icon: Info,
-    words: '版本 升级 检查更新 项目主页',
+    words: '版本 升级 检查更新 项目主页 日志 排查 断开',
   },
 ];
 const kinds: { key: NotifyKind; title: string; detail: string }[] = [
@@ -154,7 +154,7 @@ function General({
   chooseWorkspace: (reset: boolean) => void;
 }) {
   const [closeToTray, setCloseToTray] = useState<boolean | null>(null);
-  const { connection } = usePrefs();
+  const { connection, bypassPermissions } = usePrefs();
   useEffect(() => {
     void window.desktop?.windowSettings().then((values) => setCloseToTray(values.closeToTray));
   }, []);
@@ -201,7 +201,7 @@ function General({
             </div>
             <h2 className="page-heading">连接</h2>
             <div className="card">
-              <Row title="记住凭据" detail="服务凭据经当前 Windows 账户加密后保存在本机">
+              <Row title="记住凭据" detail="服务凭据经当前系统账户加密后保存在本机">
                 <Switch
                   label="记住凭据"
                   checked={form.remember}
@@ -253,6 +253,19 @@ function General({
             </div>
           </>
         )}
+        <h2 className="page-heading">审批</h2>
+        <div className="card">
+          <Row
+            title="允许绕过权限"
+            detail="审批模式里多出“绕过权限”：Claude 做任何事都不再询问，包括在你的电脑上执行命令。只建议在测试机或虚拟机里打开"
+          >
+            <Switch
+              label="允许绕过权限"
+              checked={bypassPermissions}
+              onChange={(value) => setPrefs((prefs) => ({ ...prefs, bypassPermissions: value }))}
+            />
+          </Row>
+        </div>
       </div>
     </section>
   );
@@ -267,8 +280,7 @@ function Notices() {
       <div className="page-body">
         <h1 className="page-title">通知</h1>
         <p className="muted">
-          窗口收在托盘或不在前台时，用 Windows
-          通知提醒需要你知道的事；点通知回到对应的会话。正在看的会话不会重复提醒。
+          窗口收在托盘或不在前台时，用系统通知提醒需要你知道的事；点通知回到对应的会话。正在看的会话不会重复提醒。
         </p>
         <div className="card">
           <Row title="开启通知" detail="关闭后既不弹出系统通知，也不记入通知列表">
@@ -278,7 +290,7 @@ function Notices() {
               onChange={(enabled) => set({ enabled })}
             />
           </Row>
-          <Row title="提示音" detail="弹出系统通知时播放 Windows 的通知声音">
+          <Row title="提示音" detail="弹出系统通知时播放系统的通知声音">
             <Switch
               label="提示音"
               checked={notify.sound}
@@ -352,7 +364,7 @@ function About({
         <div className="card">
           <Row
             title="客户端与服务端需要同一版本"
-            detail="服务端跟随发布页；客户端的安装包由所连接的服务端提供，下载校验后覆盖升级"
+            detail="服务端跟随发布页；客户端的安装包由所连接的服务端提供，也可以在登录页改从 GitHub 发布页下载，校验后覆盖升级"
           >
             <span className="setting-actions">
               {updates.map((item) => (
@@ -371,6 +383,25 @@ function About({
             </span>
           </Row>
         </div>
+        {window.desktop && (
+          <>
+            <h2 className="page-heading">排查</h2>
+            <div className="card">
+              <Row
+                title="连接日志"
+                detail="记录每次连接何时建立、何时断开、是哪一方先断开及原因，保存在本机；不含服务凭据、对话和命令内容。连接无故中断时可以对照服务端日志查看"
+              >
+                <button
+                  type="button"
+                  className="button"
+                  onClick={() => void window.desktop!.openLogs()}
+                >
+                  打开日志文件夹
+                </button>
+              </Row>
+            </div>
+          </>
+        )}
         {project.url && (
           <button type="button" className="button" onClick={openProject}>
             <GithubMark />

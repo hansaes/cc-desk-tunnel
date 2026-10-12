@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { ProxyClient } from '../src/client.ts';
+import { ProxyClient, RequestInterruptedError } from '../src/client.ts';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import { conversation, transcript } from '../src/transcript.ts';
 import { describe, duration, summarize } from '../src/activity.ts';
@@ -90,6 +90,37 @@ function event(sessionId, sequence, text = 'text') {
   };
 }
 
+for (const type of [
+  'session.status',
+  'session.history',
+  'account.status',
+  'usage.query',
+  'settings.get',
+  'message.send',
+  'settings.update',
+]) {
+  test(`an interrupted ${type} reply keeps its operation kind and is never replayed`, async (t) => {
+    const { client, socket, sessions } = fixture(t);
+    const result = client.request({ type, sessionId: sessions[0].id }).catch((error) => error);
+    socket.close();
+    const error = await result;
+    assert.ok(error instanceof RequestInterruptedError);
+    const readOnly = !['message.send', 'settings.update'].includes(type);
+    assert.equal(error.readOnly, readOnly);
+    assert.match(error.describe(false), /连接中断/);
+    assert.match(error.describe(true), /连接已恢复/);
+    if (readOnly) {
+      assert.match(error.describe(true), /读取未完成/);
+      assert.doesNotMatch(error.describe(true), /提交|任务可能/);
+    } else {
+      assert.match(error.describe(true), /上次请求.*确认.*未收到/);
+      assert.match(error.describe(true), /不会自动重发/);
+    }
+    assert.equal(client.pending.size, 0);
+    assert.equal(socket.sent.filter((command) => command.type === type).length, 1);
+  });
+}
+
 test('login only receives the session directory; content is loaded when selected and cache is bounded', (t) => {
   const { client, socket, sessions, snapshot } = fixture(t);
   assert.equal(client.state.selectedId, null);
@@ -126,6 +157,47 @@ test('stream notifications are batched and pending events cannot cross a disconn
   socket.message({ type: 'session.deleted', sessionId: session.id });
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(client.state.events[session.id], undefined);
+});
+
+test('output still arriving is kept apart from the history until the event that records it', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  snapshot(session, [event(session.id, 1)]);
+  const runId = randomUUID(),
+    messageId = randomUUID();
+  const piece = (text, id = messageId) =>
+    socket.message({
+      type: 'session.fragment',
+      sessionId: session.id,
+      runId,
+      payload: { type: 'text.delta', messageId: id, text },
+    });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+  piece('你');
+  piece('好');
+  await settle();
+  assert.equal(client.state.live[session.id].payload.text, '你好');
+  assert.equal(client.state.events[session.id].length, 1);
+  assert.equal(client.state.history[session.id].lastSequence, 1);
+
+  // The recorded event takes its place; what comes after it starts anew.
+  const recorded = { ...event(session.id, 2, '你好'), runId };
+  socket.message({ type: 'session.event', event: recorded });
+  piece('下一段', randomUUID());
+  await settle();
+  assert.equal(client.state.events[session.id].length, 2);
+  assert.equal(client.state.live[session.id].payload.text, '下一段');
+
+  // After a reconnect the history says where it ends and the service sends the rest again, whole.
+  client.select(session.id);
+  snapshot(session, [], { mode: 'append', lastSequence: 2 });
+  assert.equal(client.state.live[session.id], undefined);
+  piece('下一段，接着', randomUUID());
+  await settle();
+  assert.equal(client.state.live[session.id].payload.text, '下一段，接着');
+  socket.message({ type: 'session.deleted', sessionId: session.id });
+  assert.equal(client.state.live[session.id], undefined);
 });
 
 test('earlier pages prepend in one batch while preserving the newest reconnect cursor', async (t) => {
@@ -388,4 +460,109 @@ test('scheduled tasks: the file round-trips, bad tasks are named, and rules find
     taskMessage(task, wednesday),
     '[定时任务「日报」· 计划时间 2026-10-07 10:00]\n\n整理今天的提交',
   );
+});
+
+test('a remote connection that breaks is made again through a new bridge, and only a refusal ends it', async (t) => {
+  const Original = globalThis.WebSocket;
+  const sockets = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    sent = [];
+    constructor(url) {
+      this.url = url;
+      sockets.push(this);
+    }
+    send(raw) {
+      this.sent.push(JSON.parse(raw));
+    }
+    close() {
+      this.readyState = 3;
+      this.onclose?.();
+    }
+    message(message) {
+      this.onmessage({ data: JSON.stringify(message) });
+    }
+  }
+  globalThis.WebSocket = Socket;
+  const client = new ProxyClient();
+  t.after(() => {
+    client.disconnect();
+    globalThis.WebSocket = Original;
+  });
+  let bridges = 0;
+  const device = { id: randomUUID(), name: 'this computer' };
+  const now = new Date().toISOString();
+  const session = {
+    id: randomUUID(),
+    title: 'kept',
+    projectPath: 'D:\\project',
+    device,
+    permissionMode: 'auto',
+    createdAt: now,
+    updatedAt: now,
+    activeRun: null,
+  };
+  const ready = (socket) =>
+    socket.message({
+      type: 'ready',
+      protocolVersion: PROTOCOL_VERSION,
+      version: '0.0.1',
+      connectionId: randomUUID(),
+      adapter: 'claude-code',
+      sessions: [session],
+    });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+  const connect = () =>
+    client.connect(
+      'ws://127.0.0.1/ws',
+      'test-token-with-enough-characters',
+      device,
+      true,
+      async () => `ws://127.0.0.1:${9000 + ++bridges}/bridge`,
+    );
+
+  // Before it ever stood, a failure is shown and nothing is tried again.
+  connect();
+  await settle();
+  sockets[0].message({ type: 'connection.error', code: 'connection_lost', message: '连不上' });
+  assert.equal(client.state.status, 'disconnected');
+  assert.equal(client.state.error, '连不上');
+
+  connect();
+  await settle();
+  ready(sockets[1]);
+  client.select(session.id);
+  assert.equal(client.state.status, 'connected');
+  sockets[1].message({ type: 'connection.error', code: 'connection_lost', message: '断了' });
+  assert.equal(client.state.status, 'reconnecting');
+  // What the window showed stays; the attempt waiting for its turn is made at once on request.
+  assert.equal(client.state.selectedId, session.id);
+  assert.equal(client.state.sessions.length, 1);
+  client.retryNow();
+  await settle();
+  assert.equal(sockets.length, 3);
+  assert.equal(sockets[2].url, 'ws://127.0.0.1:9003/bridge');
+  ready(sockets[2]);
+  assert.equal(client.state.status, 'connected');
+  assert.equal(client.state.error, null);
+  // The selected session is read on from where the window had it.
+  assert.equal(sockets[2].sent.at(-1).type, 'session.subscribe');
+
+  // A connection that just ends is a fault on the way too.
+  sockets[2].close();
+  assert.equal(client.state.status, 'reconnecting');
+  client.retryNow();
+  await settle();
+  // The service refusing this client is not.
+  sockets[3].message({ type: 'connection.error', code: 'unauthorized', message: '凭据不对' });
+  assert.equal(client.state.status, 'disconnected');
+
+  // Leaving on purpose is said to the service first.
+  connect();
+  await settle();
+  ready(sockets[4]);
+  client.disconnect();
+  assert.equal(sockets[4].sent.at(-1).type, 'leave');
+  assert.equal(bridges, 5);
 });

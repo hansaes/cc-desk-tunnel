@@ -24,12 +24,13 @@
 
 运行中补充复用 SDK async user input，保持同一原生进程与 session ID；human origin 不把用户补充伪装成工具输出或系统提醒。原生可在工具间采纳或合并输入，回执通过消息 UUID 同步；代理不开发独立调度 / 记忆。输入收尾、断连 / 取消及重启按实际确认程度记录，无自动重放。
 
-## 更换项目
+## 更换项目与换电脑
 
-会话可以改指另一个 Windows 项目目录。系统提示词不在原生记录里，每次启动 CLI 时由 `systemPrompt.append` 给出，它一变，模型侧的提示缓存从它之后全部失效。为了不让更换项目和重连白白丢掉提示缓存，一个会话的系统提示词在压缩之前逐字不变：
+会话可以改指另一个项目目录，也可以从使用者的另一台电脑接过去。系统提示词不在原生记录里，每次启动 CLI 时由 `systemPrompt.append` 给出，它一变，模型侧的提示缓存从它之后全部失效。为了不让更换项目和重连白白丢掉提示缓存，一个会话的系统提示词在压缩之前逐字不变：
 
 - 更换之后，系统提示词继续写原来的路径；变更由下一条用户消息前面的一段说明告诉 Claude（`[CC Desk Tunnel: the user moved this session …]`），界面只显示用户自己写的内容。
-- 重连同理：SSH 配置用会话固定的路径（见下文“存储”），不随连接变化；所连电脑上的 PowerShell 路径与提示词里的不同时（客户端装到了别处，或换了一台电脑），同样随下一条用户消息说明（`[CC Desk Tunnel: the PowerShell executable … is now …]`）。
+- 换电脑同理：会话被另一台设备接过去之后，说明里写明换了电脑、那台电脑的名字和它上面的项目目录（`[CC Desk Tunnel: the user now continues this session from another of their computers …]`）。
+- 重连不需要说明：SSH 配置用会话固定的路径（见下文“存储”），不随连接变化；提示词里不写设备上任何程序或文件的位置，PowerShell 和定时任务文件由设备上的环境变量 `CC_DESK_TUNNEL_PWSH`、`CC_DESK_TUNNEL_SCHEDULES` 指明，客户端装在哪里都一样。
 - 系统提示词在缓存前缀本来就要失效的时刻跟上当前值：观察到压缩事件之后的下一轮。
 - 还没有原生上下文的会话直接改路径，没有说明。
 
@@ -43,9 +44,11 @@ Claude Code 原生存储是模型会话上下文的唯一权威，包含原生�
 - 首轮 `sessionId`，后续 `resume`；显式 `persistSession: true`。即使每轮启动新 CLI 进程，原生上下文仍由同一 session 恢复。
 - 恢复前通过官方 `getSessionInfo` 检查原生记录存在；缺失则明确失败，不静默另开会话，不用代理事件假装恢复。
 - 运行结束通过官方接口确认记录已保存，并同步保存状态到 GUI。压缩由 CLI 执行，客户端只展示实际公开的压缩 / 状态事件。
+- SSH 配置里一台设备有两个主机名。`device` 原样执行一条命令行（Windows 上由 cmd.exe 解析），scp / sftp 也用它；`device-script` 是同一台设备加上一条固定的 `RemoteCommand`：把标准输入整段读成 PowerShell 7 脚本再执行，UTF-8、纯文本报错、保留退出码。提示词让 Claude 把脚本用 here-document 送给 `device-script`，脚本不经过任何一层命令行，不需要转义或编码，也没有长度限制。就绪探测走的是同一个主机名。PowerShell 自带的 `-Command -` 与 `-File -` 逐行处理标准输入，跨行的块会丢失，所以不用。
+- 每台设备另有一个固定的入口 `devices/<device-id>/`：端口和配置路径在设备在线及宽限期内不变，密钥随每次连接更换；会话的 SSH 配置指向它，所以重连对正在运行的 CLI 没有任何可见变化，设备不在时新发起的命令在入口处等待（最长一分钟）。
 - 临时 SSH config / key 在 `connections/<connection-id>/`；断连回收这个目录，不碰 `native/<session-id>/`、CLI 原生 transcript 或记忆。系统提示词里写的不是这个目录，而是每个会话固定的 `session-ssh/<session-id>.conf`，它只有一行 `Include`，每次运行前指向当前连接的配置：连接目录每次重连都换，提示词若跟着变，模型侧的提示缓存从系统提示词之后全部失效，整段对话要重新写入缓存。重连不丢失会话，也不改变提示词。
 
-代理 `PROXY_DATA_DIR/sessions.sqlite` 只是 GUI 事件、项目绑定、审批偏好与索引的展示镜像；Windows 只有有界会话内容缓存与草稿，打开会话按页拉取，不重放所有 token。不应把“界面历史存在”当作“原生上下文存在”。
+代理 `PROXY_DATA_DIR/sessions.sqlite` 只是 GUI 事件、项目绑定、审批偏好与索引的展示镜像；Windows 只有有界会话内容缓存与草稿，打开会话按页拉取，不重放所有 token。镜像里一段输出只存一条；输出途中的片段只转发给正在看的窗口，不落盘。不应把“界面历史存在”当作“原生上下文存在”。
 
 已实测：写入唯一记忆值后退出 CLI、关闭隧道、更换临时密钥并重启代理服务；再次只发送新问题，原生会话准确回忆该值。没有重发历史消息，没有把代理事件拼成 prompt。该测试证明当前恢复链路可用，不替代极长任务压缩、磁盘故障和备份恢复验收。
 
@@ -61,6 +64,6 @@ Claude Code 原生存储是模型会话上下文的唯一权威，包含原生�
 
 ## 默认审批
 
-新会话默认请求原生 `auto`，CLI 自己判断风险；没有本项目第二套 AI 审批器，也不把 auto 换成 bypassPermissions。GUI 可改为原生 `default` / `plan` / `acceptEdits`，偏好保存在 Linux。实际模式读取 `system.init.permissionMode`；版本 / 模型 / 提供方不支持时显示实际值及原生提示。
+新会话默认请求原生 `auto`，CLI 自己判断风险；没有本项目第二套 AI 审批器，也不把 auto 换成 bypassPermissions。GUI 可改为原生 `default` / `plan` / `acceptEdits`，偏好保存在 Linux；`bypassPermissions`（绕过权限，什么都不再询问）只在使用者于“设置 → 常规 → 审批”里允许后才出现在选项里，选中前再确认一次，从不作为默认。实际模式读取 `system.init.permissionMode`；版本 / 模型 / 提供方不支持时显示实际值及原生提示。
 
 `canUseTool` 仍接出原生升级到用户的请求，仅作为必要时人工允许 / 拒绝入口；Claude 的提问（`AskUserQuestion`）走同一入口，界面展示问题与选项，用户的选择按官方结构放进 `updatedInput.answers` 返回，不回答则按拒绝返回；不能因默认 auto 就移除或自动允许所有请求。`auto` 下多数操作不需要人工，但这不是所有命令、模型或提供方都不需要人工的保证。

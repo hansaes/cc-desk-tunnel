@@ -8,9 +8,14 @@ import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
 import { startWindowsSsh } from './windows-ssh.mjs';
+import { startPosixSsh } from './posix-ssh.mjs';
 import { openChannels } from './tunnel-channels.mjs';
 import { httpProxy, openSocket } from './system-proxy.mjs';
-import { channelFailure, controlFailure } from './connect-errors.mjs';
+import { channelFailure, controlFailure, passing } from './connect-errors.mjs';
+
+// The SSH service of a connection. The two are started and closed alike and give the same credentials; what
+// is behind them differs with the system: see each module.
+export const startLocalSsh = process.platform === 'win32' ? startWindowsSsh : startPosixSsh;
 
 export function certificateMatches(observed, trusted) {
   if (typeof trusted !== 'string' || typeof observed !== 'string') return false;
@@ -42,8 +47,17 @@ async function connectService(address, config, resolveProxy, route) {
   const port = Number(address.port || 443);
   const proxy = httpProxy(await resolveProxy?.(`https://${address.hostname}:${port}`));
   if (route) route.proxy = proxy;
+  const socket = await openSocket(
+    proxy,
+    address.hostname,
+    port,
+    connectionWaits(config.waits).connect,
+  );
+  // Lets the system notice a path that has gone, where something on the way would otherwise drop a quiet
+  // connection without a word.
+  socket.setKeepAlive(true, 30000);
   return connect({
-    socket: await openSocket(proxy, address.hostname, port, connectionWaits(config.waits).connect),
+    socket,
     servername: isIP(address.hostname) ? undefined : address.hostname,
     ...controlTlsOptions(config),
   });
@@ -96,6 +110,8 @@ export async function openProxyBridge(
   // A malformed pin is refused here, before anything listens or connects.
   controlTlsOptions(config);
   const waits = connectionWaits(config.waits);
+  const log = binaries.log ?? (() => {});
+  const heartbeatMs = binaries.heartbeatMs ?? 15000;
   const nonce = randomBytes(32).toString('hex');
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
@@ -105,6 +121,8 @@ export async function openProxyBridge(
   let release;
   let closed = false;
   let closing;
+  // The window said it is ending the connection on purpose; the service is told, so that it keeps nothing.
+  let leaving = false;
   server.on('upgrade', (request, socket, head) => {
     if (
       closed ||
@@ -143,12 +161,23 @@ export async function openProxyBridge(
     let nativeReady;
     let offerReceived = false;
     const target = `${address.hostname}:${address.port || 443}`;
+    const began = Date.now();
+    log(`Connecting to ${target}.`);
+    // The service asks for a sign of life every 15 seconds and gives up after two without an answer. A path
+    // that stops delivering without closing would leave this side waiting for good: the page shows a run that
+    // the service has long ended. So this side asks as well, and counts whatever arrives from the service.
+    let heard = Date.now();
+    let heartbeat;
+    const alive = () => (heard = Date.now());
+    remote.on('ping', alive);
+    remote.on('pong', alive);
     const timer = setTimeout(
       () =>
         fail(
           offerReceived
             ? channelFailure(waits.ready / 1000, current.channels?.lastError, target, route.proxy)
             : `服务端在 ${waits.ready / 1000} 秒内没有完成应答。\n请检查网络是否稳定，或稍后重试；反复出现时查看服务端日志。`,
+          'connection_lost',
         ),
       waits.ready,
     );
@@ -192,9 +221,12 @@ export async function openProxyBridge(
         });
       });
     }
-    function fail(message) {
+    // `connection_lost` is a fault on the way, which the window may try again; `client_failed` is something
+    // that trying again does not change.
+    function fail(message, code = 'client_failed') {
+      if (!closed) log(`Connection given up: ${message}`);
       if (local.readyState === WebSocket.OPEN)
-        local.send(JSON.stringify({ type: 'connection.error', code: 'tunnel_failed', message }));
+        local.send(JSON.stringify({ type: 'connection.error', code, message }));
       clearTimeout(timer);
       void close(true);
     }
@@ -209,16 +241,39 @@ export async function openProxyBridge(
         return;
       }
       verified = true;
+      log(`Reached ${target}${route.proxy ? ' through the system proxy' : ''}.`);
       for (const message of queue) remote.send(message);
       queue.length = 0;
+      alive();
+      heartbeat = setInterval(() => {
+        const silent = Date.now() - heard;
+        // Its own question is answered within moments, so the third one unanswered falls just short of three
+        // periods of silence.
+        if (silent > heartbeatMs * 2.5)
+          fail(
+            `已有 ${Math.round(silent / 1000)} 秒没有收到服务端的任何数据，连接已经断开。\n途中的网络、代理或反向代理中断了这条连接而没有通知本机。`,
+            'connection_lost',
+          );
+        else if (remote.readyState === WebSocket.OPEN) remote.ping();
+      }, heartbeatMs);
+      current.controller.signal.addEventListener('abort', () => clearInterval(heartbeat));
     });
     local.on('message', (raw) => {
       try {
         const message = JSON.parse(raw.toString('utf8'));
         if (message.type?.startsWith('tunnel.')) throw new Error('Renderer tunnel message');
+        if (message.type === 'leave') {
+          leaving = true;
+          return;
+        }
         if (message.type === 'auth') {
           message.tunnel = true;
           token = String(message.token);
+        }
+        // The system this computer runs is said here, not by the page. Windows is what none means.
+        if (message.type === 'device') {
+          delete message.platform;
+          if (process.platform !== 'win32') message.platform = process.platform;
         }
         if (verified && remote.readyState === WebSocket.OPEN) remote.send(JSON.stringify(message));
         else queue.push(JSON.stringify(message));
@@ -227,6 +282,7 @@ export async function openProxyBridge(
       }
     });
     remote.on('message', (raw) => {
+      alive();
       let message;
       try {
         message = serverMessageSchema.parse(JSON.parse(raw.toString('utf8')));
@@ -236,13 +292,15 @@ export async function openProxyBridge(
       }
       // A service of another version refuses the connection but may still offer the installer for its own.
       if (message.type === 'connection.error' && message.client) release = message.client;
+      if (message.type === 'connection.error')
+        log(`The service refused or ended the connection: ${message.code}.`);
       if (message.type === 'tunnel.offer') {
         if (offerReceived || !nativeReady || nativeReady.connectionId !== message.connectionId) {
           fail('隧道连接标识不匹配。');
           return;
         }
         offerReceived = true;
-        current.preparing = startWindowsSsh(
+        current.preparing = startLocalSsh(
           message.connectionId,
           binaries,
           current.controller.signal,
@@ -269,6 +327,9 @@ export async function openProxyBridge(
           return;
         }
         clearTimeout(timer);
+        log(
+          `Connected as ${message.connectionId.slice(0, 8)} to service ${nativeReady.version ?? 'of unknown version'}; commands can run.`,
+        );
         if (local.readyState === WebSocket.OPEN) local.send(JSON.stringify(nativeReady));
       } else if (local.readyState === WebSocket.OPEN) {
         if (message.type === 'ready') clearTimeout(timer);
@@ -276,8 +337,13 @@ export async function openProxyBridge(
       }
     });
     for (const socket of [local, remote]) {
-      socket.on('close', () => {
+      socket.on('close', (code) => {
         clearTimeout(timer);
+        // Who ended it first is what tells a fault on the way from a decision of this program or the service.
+        if (!closed)
+          log(
+            `${socket === remote ? 'The service side' : 'The window'} closed the connection first, code ${code}, after ${Math.round((Date.now() - began) / 1000)} s.`,
+          );
         void close(true);
       });
       socket.on('error', (error) =>
@@ -287,17 +353,28 @@ export async function openProxyBridge(
             `${address.hostname}:${address.port || 443}`,
             socket === remote ? route.proxy : null,
           ),
+          socket === remote && passing(error) ? 'connection_lost' : 'client_failed',
         ),
       );
     }
   });
   async function close(notify = false) {
     if (closing) return closing;
+    if (pair && !notify) log('Connection closed from this client.');
     closed = true;
     closing = (async () => {
       pair?.controller.abort();
       pair?.local.close();
-      pair?.remote.terminate();
+      // Ended on purpose, by the window or by this program: the service hears it before the connection goes,
+      // and ends what this computer was running instead of keeping it for a return.
+      const remote = pair?.remote;
+      if (remote?.readyState === WebSocket.OPEN && (leaving || !notify))
+        await new Promise((resolve) => {
+          remote.once('close', resolve);
+          setTimeout(resolve, 1000);
+          remote.send(JSON.stringify({ type: 'leave' }), () => remote.close(1000));
+        });
+      remote?.terminate();
       await pair?.preparing;
       pair?.channels?.close();
       await pair?.ssh?.close();
@@ -315,6 +392,9 @@ export async function openProxyBridge(
   // Fetches the installer the service announced and accepts it only if its hash matches. Works after the
   // connection closed, as it does when the service refused this client's version.
   async function downloadInstaller(directory) {
+    // The service holds the Windows installer only.
+    if (process.platform !== 'win32')
+      throw new Error('这个系统上的客户端不能在应用内升级，请到发布页下载新版本。');
     if (!release || !token) throw new Error('服务端没有提供客户端安装包。');
     const expected = release;
     const target = join(directory, `CC-Desk-Tunnel-Setup-${expected.version}-x64.exe`);
@@ -339,5 +419,7 @@ export async function openProxyBridge(
     url: `ws://127.0.0.1:${server.address().port}/bridge/${nonce}`,
     close,
     downloadInstaller,
+    // The installer the service last announced, if any.
+    release: () => release,
   };
 }

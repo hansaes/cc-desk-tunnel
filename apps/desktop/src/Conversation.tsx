@@ -284,6 +284,7 @@ function Message({
 
 function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: Live }) {
   const active = !turn.endedAt;
+  const notes = turn.steps.filter((step) => step.kind === 'assistant').length;
   const steps = () =>
     turn.steps.map((step, index) =>
       step.kind === 'work' ? (
@@ -300,8 +301,18 @@ function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: L
     );
   return (
     <>
-      {turn.question && (
-        <Message item={turn.question} native={native} edit={turn.joined ? undefined : live.edit} />
+      {turn.question?.continued ? (
+        <div className="run-notice" role="status">
+          {turn.question.text}
+        </div>
+      ) : (
+        turn.question && (
+          <Message
+            item={turn.question}
+            native={native}
+            edit={turn.joined ? undefined : live.edit}
+          />
+        )
       )}
       {active
         ? steps()
@@ -312,6 +323,7 @@ function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: L
                 <span>
                   用时 {duration(turn.startedAt, turn.endedAt!)}
                   {turn.tools > 0 && ` · ${turn.tools} 步`}
+                  {notes > 0 && ` · ${notes} 条说明`}
                 </span>
               }
             >

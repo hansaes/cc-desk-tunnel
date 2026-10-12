@@ -65,6 +65,12 @@ test('desktop login, chat, allow/deny, stop, errors and delete', async ({ page }
   await page.getByRole('button', { name: '停止运行', exact: true }).click();
   await expect(page.getByText('用户停止', { exact: true })).toBeVisible();
   await settled(page);
+  // The stopped turn is taken up again from the message box, with nothing written.
+  const resume = page.getByRole('button', { name: '接着上一轮继续', exact: true });
+  await resume.click();
+  await expect(page.locator('.run-notice').filter({ hasText: /^继续$/ })).toBeVisible();
+  await settled(page);
+  await expect(resume).toHaveCount(0);
   await send(page, '错误测试', 'error');
   await expect(
     page.getByText('模拟上游连接失败；没有执行本机命令。', { exact: true }),
@@ -95,6 +101,29 @@ test('narrow screen, safe Markdown, switching and cancellation while awaiting ap
   expect(await page.evaluate(() => 'untrusted' in window)).toBe(false);
   await expandActivity(page);
   await expect(page.locator('.message.assistant pre')).toBeVisible();
+  // Formulas in either notation are typeset, a dollar in code and the dollars of prices are left alone (they
+  // would otherwise make a fourth formula), and a drawing is shown as an
+  // image, which runs nothing.
+  await send(
+    page,
+    '行内 $a^2+b^2$ 与 \\(c^2\\)，价格 `$5 \\(x\\)`，这件 $5，苹果 $5，香蕉 $8：\n\n\\[\nE=mc^2\n\\]\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><script>window.untrusted = true</script><circle cx="20" cy="20" r="18"/></svg>\n```',
+  );
+  await settled(page);
+  await expandActivity(page);
+  const typeset = page.locator('.transcript');
+  await expect(typeset.locator('.katex')).toHaveCount(3);
+  await expect(typeset.locator('.katex-display')).toHaveCount(1);
+  await expect(typeset.locator(':not(pre) > code')).toHaveText('$5 \\(x\\)');
+  const picture = typeset.getByRole('img', { name: 'SVG 图像' });
+  await expect(picture).toBeVisible();
+  await expect
+    .poll(() => picture.evaluate((image: HTMLImageElement) => image.naturalWidth))
+    .toBe(40);
+  expect(await page.evaluate(() => 'untrusted' in window)).toBe(false);
+  await noOverflow(page);
+  await page.screenshot({ path: resolve(screenshots, 'mobile-formula.png') });
+  await typeset.getByRole('button', { name: '查看源码', exact: true }).click();
+  await expect(typeset.locator('pre').last()).toContainText('<circle');
   await send(page, '取消审批', 'tool');
   await expect(page.getByRole('button', { name: '允许', exact: true })).toBeVisible();
   await noOverflow(page);
@@ -429,6 +458,44 @@ test('a project folds its sessions away, remembers it, and a search still finds 
   await expect(rows).toHaveCount(0);
   await expand.click();
   await expect(rows.filter({ hasText: title })).toHaveCount(1);
+});
+
+test('a session on another computer is listed apart, read, and taken over with a directory here', async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  await page.goto('/');
+  await login(page);
+  const title = await createSession(page, '换电脑');
+  await send(page, '第一台电脑上的话');
+  await settled(page);
+  // Another browser profile is another computer to the service.
+  const context = await browser.newContext({ baseURL });
+  const other = await context.newPage();
+  await other.goto('/');
+  await login(other);
+  const row = other.locator('.session-row').filter({ hasText: title });
+  await expect(row).toHaveCount(0);
+  await other.getByRole('button', { name: '展开其他设备的会话', exact: true }).click();
+  await row.click();
+  await expect(other.getByText('第一台电脑上的话')).toBeVisible();
+  const bar = other.locator('.elsewhere-bar');
+  await expect(bar).toContainText('浏览器');
+  await expect(other.locator('.composer')).toHaveCount(0);
+  await other.screenshot({ path: resolve(screenshots, 'desktop-elsewhere.png') });
+  other.once('dialog', (dialog) => void dialog.accept('E:\\另一台\\接管目录'));
+  await bar.getByRole('button', { name: '在本机继续…', exact: true }).click();
+  await expect(bar).toHaveCount(0);
+  await expect(
+    other.locator('.project-group').filter({ hasText: '接管目录' }).locator('.session-row'),
+  ).toHaveCount(1);
+  await send(other, '第二台电脑上的话');
+  await settled(other);
+  // The computer it was taken from still has it open, and now as one of another's.
+  await expect(page.locator('.elsewhere-bar')).toContainText('接管目录');
+  await expect(page.getByText('第二台电脑上的话')).toBeVisible();
+  await context.close();
 });
 
 test('usage log: period-independent totals, chart hover, model filter and table', async ({

@@ -282,6 +282,12 @@ button.chip:hover:not(:disabled) {
 .chip.quiet {
   background: var(--surface-2);
 }
+/* The approval mode that asks about nothing must not look like the others. */
+.chip.danger,
+button.chip.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 .brand {
   display: flex;
   align-items: center;
@@ -432,6 +438,10 @@ button.chip:hover:not(:disabled) {
   padding: 0 calc(100vw - env(titlebar-area-width, 100vw) + 10px) 0 10px;
   -webkit-app-region: drag;
   user-select: none;
+}
+/* macOS draws them at the left end instead. */
+html[data-platform='darwin'] .titlebar {
+  padding: 0 10px 0 78px;
 }
 .titlebar button {
   -webkit-app-region: no-drag;
@@ -936,8 +946,35 @@ button.chip:hover:not(:disabled) {
 .menu button:disabled {
   color: var(--faint);
 }
-.menu button.danger:not(:disabled) {
+.menu button.danger:not(:disabled),
+.permission-menu button.danger,
+.permission-menu button.danger small {
   color: var(--danger);
+}
+.permission-menu button.danger > svg {
+  color: inherit;
+}
+.permission-confirm {
+  margin: 0;
+  padding: 6px 10px 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.permission-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 6px 4px;
+}
+.permission-menu .permission-confirm-actions button {
+  width: auto;
+  border: 1px solid var(--line);
+  padding: 5px 12px;
+}
+.permission-menu .permission-confirm-actions button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: white;
 }
 .menu button > svg,
 .permission-menu button > svg {
@@ -1019,6 +1056,17 @@ button.chip:hover:not(:disabled) {
 }
 .page-notes code {
   overflow-wrap: anywhere;
+}
+.text-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.text-link:hover {
+  text-decoration: underline;
 }
 .card {
   border: 1px solid var(--line);
@@ -1300,11 +1348,32 @@ kbd {
 .code-block {
   position: relative;
 }
-.code-block > .copy-button {
+.code-actions {
   position: absolute;
   right: 7px;
   top: 7px;
+  display: flex;
+  gap: 4px;
+}
+.code-actions > .copy-button {
   background: var(--surface-2);
+}
+/* A drawing takes the place of its source, on the same ground as the code would have. */
+.code-picture {
+  display: block;
+  box-sizing: border-box;
+  max-width: 100%;
+  max-height: 520px;
+  margin: 10px 0;
+  padding: 38px 14px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-s);
+  background: white;
+}
+.message-content .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
 }
 .message-content .code-block > pre {
   padding-top: 38px;
@@ -1522,6 +1591,10 @@ kbd {
 .work > summary:hover,
 .tool > summary:hover {
   color: #2f3742;
+}
+.turn-process > .message {
+  font-size: 14px;
+  color: var(--text);
 }
 .turn-process svg,
 .work svg {
@@ -1764,6 +1837,33 @@ details[open] > summary > .fold-chevron {
   height: 30px;
   border-radius: 50%;
 }
+/* The ring starts at the top and fills clockwise. */
+.context-ring {
+  width: 18px;
+  height: 18px;
+  transform: rotate(-90deg);
+}
+.context-ring circle {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 2.5;
+}
+.context-ring .context-ring-used {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  transition:
+    stroke-dasharray 0.4s ease,
+    stroke 0.4s ease;
+}
+.context-ring.unknown .context-ring-used {
+  stroke: none;
+}
+.context-ring.high .context-ring-used {
+  stroke: var(--warn);
+}
+.context-ring.full .context-ring-used {
+  stroke: var(--danger);
+}
 .context-tooltip,
 .model-menu,
 .slash-menu,
@@ -1908,6 +2008,36 @@ details[open] > summary > .fold-chevron {
 }
 .model-menu input[type='range']:disabled {
   opacity: 0.6;
+}
+/* No level known yet: no fill and no handle, so nothing claims a value; picking one brings the handle back. */
+.model-menu input[type='range'][data-unset] {
+  background: var(--hover);
+}
+.model-menu input[type='range'][data-unset]::-webkit-slider-thumb {
+  opacity: 0;
+}
+/* Level names under the track, centred on the handle's positions: the handle is 30px, so its centre runs
+   from 15px to 15px short of the other end. */
+.effort-ticks {
+  position: relative;
+  height: 26px;
+  margin-top: 4px;
+}
+.effort-ticks button {
+  position: absolute;
+  left: calc(15px + (100% - 30px) * var(--at));
+  transform: translateX(-50%);
+  padding: 4px 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.effort-ticks button.current {
+  color: var(--text);
+  font-weight: 600;
 }
 .model-options {
   max-height: min(320px, 40dvh);
@@ -2621,6 +2751,32 @@ details[open] > summary > .fold-chevron {
   color: #907533;
   border-color: #eee3c6;
   justify-content: flex-start;
+}
+.elsewhere-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  max-width: 820px;
+  margin: 0 auto 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-l);
+  background: var(--surface);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.elsewhere-bar > svg {
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+.elsewhere-bar p {
+  flex: 1 1 320px;
+  margin: 0;
+}
+.elsewhere-bar code {
+  overflow-wrap: anywhere;
 }
 dialog {
   border: 1px solid var(--line);

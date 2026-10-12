@@ -12,6 +12,7 @@ const {
   dialog,
   shell,
   clipboard,
+  net,
 } = require('electron');
 const path = require('node:path');
 const {
@@ -27,9 +28,12 @@ const {
 } = require('node:fs');
 const { mkdtemp, stat, writeFile } = require('node:fs/promises');
 const { gitBranch } = require('./git-branch.cjs');
-const { tmpdir } = require('node:os');
+const { asOnDisk } = require('./disk-path.cjs');
+const { openLog } = require('./client-log.cjs');
+const { hostname, tmpdir } = require('node:os');
+const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { mkdir, rmdir } = require('node:fs/promises');
+const { mkdir, readdir, rmdir, unlink } = require('node:fs/promises');
 const { pathToFileURL } = require('node:url');
 let bridge;
 // The last connection, kept for its installer download after a service refused this client's version.
@@ -45,6 +49,8 @@ function showWindow() {
   window.focus();
 }
 app.on('second-instance', showWindow);
+// macOS: a click on the Dock icon while the window is hidden.
+app.on('activate', showWindow);
 
 // Window preferences and the optional saved sign-in live in the user's profile, outside the install directory.
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
@@ -59,6 +65,14 @@ function writeSettings(values) {
   const settings = { ...readSettings(), ...values };
   writeFileSync(settingsPath(), JSON.stringify(settings, null, 2));
   return settings;
+}
+
+// See client-log.cjs. Opened on first use, once the profile directory is known.
+let record;
+function log(text) {
+  record ??= openLog(path.join(app.getPath('userData'), 'logs'));
+  record.write(text);
+  return record.directory;
 }
 
 // A remote connection carries long unattended runs; the computer must not go to sleep underneath it.
@@ -88,6 +102,7 @@ handle('project:choose', async (event) => {
   });
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
+handle('project:spelling', (_event, written) => asOnDisk(String(written)));
 // Files the user wants to mention in a message: only their paths go to the page.
 handle('files:choose', async (event) => {
   const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
@@ -96,6 +111,33 @@ handle('files:choose', async (event) => {
   });
   return result.canceled ? [] : result.filePaths;
 });
+// A picture that is only on the clipboard has no file Claude could be pointed at. It is written into the
+// profile, from where Claude reads it like any other attached file; a week later it is removed at start.
+const pastedDirectory = () => path.join(app.getPath('userData'), 'pasted');
+const pictureTypes = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+};
+handle('image:save', async (_event, type, bytes) => {
+  const extension = pictureTypes[String(type)];
+  if (!extension || !(bytes instanceof Uint8Array) || !bytes.length || bytes.length > 20 << 20)
+    throw new Error('只能粘贴不超过 20 MB 的图片。');
+  await mkdir(pastedDirectory(), { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const target = path.join(pastedDirectory(), `${stamp}-${randomUUID().slice(0, 6)}.${extension}`);
+  await writeFile(target, bytes);
+  return target;
+});
+async function clearPastedPictures() {
+  for (const name of await readdir(pastedDirectory()).catch(() => [])) {
+    const file = path.join(pastedDirectory(), name);
+    const age = Date.now() - (await stat(file).catch(() => ({ mtimeMs: Date.now() }))).mtimeMs;
+    if (age > 7 * 24 * 3600 * 1000) await unlink(file).catch(() => {});
+  }
+}
 // Writes text the page produced (an exported session) where the user chooses.
 handle('file:save', async (event, name, text) => {
   const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
@@ -111,6 +153,10 @@ handle('folder:open', async (_event, directory) => {
   const target = path.resolve(String(directory));
   if (!(await stat(target)).isDirectory()) throw new Error('不是文件夹。');
   const failure = await shell.openPath(target);
+  if (failure) throw new Error(failure);
+});
+handle('log:open', async () => {
+  const failure = await shell.openPath(log('The log folder was opened.'));
   if (failure) throw new Error(failure);
 });
 handle('git:branch', (_event, directory) => gitBranch(directory));
@@ -129,7 +175,7 @@ handle('external:open', async (event, target) => {
     throw new Error('Unexpected link');
   await shell.openExternal(url.toString());
 });
-// Sessions without a project still need a Windows working directory; they get one under Documents, grouped by
+// Sessions without a project still need a working directory on this computer; they get one under Documents, grouped by
 // day, unless the user chose another folder. Folders used before are remembered: their sessions are still
 // sessions without a project.
 const defaultRoot = () => path.join(app.getPath('documents'), 'CC Desk Tunnel');
@@ -138,8 +184,10 @@ function workspaceRoots() {
   const roots = [...(Array.isArray(saved) ? saved : []), defaultRoot()].filter(
     (root) => typeof root === 'string' && root,
   );
+  // Windows and macOS take a path in any case; Linux tells the cases apart.
+  const key = (root) => (process.platform === 'linux' ? root : root.toLowerCase());
   return roots.filter(
-    (root, index) => roots.findIndex((item) => item.toLowerCase() === root.toLowerCase()) === index,
+    (root, index) => roots.findIndex((item) => key(item) === key(root)) === index,
   );
 }
 handle('workspace:roots', () => workspaceRoots());
@@ -215,7 +263,10 @@ handle('proxy:connect', async (event, config) => {
       scriptDirectory: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar.unpacked/electron')
         : undefined,
-      // The Windows proxy settings (manual, script or automatic detection) as Chromium reads them.
+      // Where Claude finds the scheduled tasks to edit; the service names the variable, not the path.
+      environment: { CC_DESK_TUNNEL_SCHEDULES: schedulesPath() },
+      log,
+      // The system's proxy settings (manual, script or automatic detection) as Chromium reads them.
       resolveProxy: (url) => session.defaultSession.resolveProxy(url),
     },
     () => {
@@ -233,7 +284,8 @@ handle('proxy:connect', async (event, config) => {
   keepAwake(true);
   return { url: bridge.url };
 });
-// The service token is kept only when the user asks, encrypted for the current Windows account.
+// The service token is kept only when the user asks, encrypted for the current account of the system (DPAPI on
+// Windows, the login keychain on macOS).
 handle('login:load', () => {
   const { login } = readSettings();
   if (!login) return null;
@@ -322,6 +374,11 @@ handle('schedules:save', (_event, text) => {
   replaceFile(schedulesPath(), schedules);
 });
 handle('app:version', () => app.getVersion());
+// Which of the user's computers this is to the service: an ID made once and kept, under the computer's name.
+handle('device:get', () => ({
+  id: readSettings().deviceId ?? writeSettings({ deviceId: randomUUID() }).deviceId,
+  name: hostname(),
+}));
 handle('app:quit', () => app.quit());
 let refreshTray = () => {};
 handle('window:settings', () => ({ closeToTray: readSettings().closeToTray !== false }));
@@ -352,20 +409,42 @@ handle('notify:show', (event, notice) => {
       event.sender.send('notify:clicked', notice?.sessionId ? String(notice.sessionId) : null);
   });
   toast.show();
-  // A window left open behind others also asks for attention in the taskbar.
-  if (window.isVisible() && !inFront) {
+  // What waits for the user also asks for attention in the taskbar or the Dock, from a window left open
+  // behind others. The rest is said by the notification alone: an icon that flashes long after the
+  // notification went away, or where the system shows none, points at nothing.
+  if (notice?.attention === true && window.isVisible() && !inFront) {
     window.flashFrame(true);
     window.once('focus', () => window.flashFrame(false));
   }
 });
-// Upgrades in place: the installer comes from the connected service, runs silently over the current install
-// and starts the new version.
-handle('update:install', async () => {
-  if (!lastBridge) throw new Error('请先连接服务。');
+// Upgrades in place: the installer runs silently over the current install and starts the new version. It
+// comes from the connected service, or, when the user chooses so, straight from the release page: `version`
+// is then the one to fetch, which the service's refusal of this client named.
+handle('update:install', async (event, version) => {
   if (!app.isPackaged) throw new Error('源码运行不支持自升级；请重新打包安装。');
-  const installer = await lastBridge.downloadInstaller(
-    await mkdtemp(path.join(tmpdir(), 'cc-desk-tunnel-update-')),
-  );
+  // Only the Windows installer can be run over an installation. Elsewhere the user installs a new package.
+  if (process.platform !== 'win32')
+    throw new Error('这个系统上的客户端不能在应用内升级，请到发布页下载新版本。');
+  const directory = await mkdtemp(path.join(tmpdir(), 'cc-desk-tunnel-update-'));
+  let installer;
+  if (version === undefined) {
+    if (!lastBridge) throw new Error('请先连接服务。');
+    installer = await lastBridge.downloadInstaller(directory);
+  } else {
+    const { downloadRelease } = await import(
+      pathToFileURL(path.join(__dirname, 'release-download.mjs')).href
+    );
+    let told = 0;
+    // Chromium's network stack: the Windows proxy settings apply, as they do to the connection itself.
+    installer = await downloadRelease((url, init) => net.fetch(url, init), version, directory, {
+      announced: lastBridge?.release(),
+      progress(received, size) {
+        if (Date.now() - told < 500 && received < size) return;
+        told = Date.now();
+        if (!event.sender.isDestroyed()) event.sender.send('update:progress', { received, size });
+      },
+    });
+  }
   spawn(installer, ['/S', '--force-run'], { detached: true, stdio: 'ignore' }).unref();
   app.quit();
 });
@@ -381,15 +460,49 @@ ipcMain.handle('proxy:disconnect', async () => {
 if (process.platform === 'win32')
   app.setAppUserModelId(app.isPackaged ? 'io.github.ccdesktunnel.desktop' : process.execPath);
 app.whenReady().then(() => {
+  log(`Client ${app.getVersion()} started.`);
+  void clearPastedPictures();
   if (!ownsInstance) return;
   // Shortcuts are the page's, where the user can change them or turn them off; Electron's default menu would
   // add its own on top (zoom, reload, close). A run from source keeps reload and the developer tools.
+  // macOS has one menu bar for every program and takes the keys of copying, pasting, hiding and quitting from
+  // what is in it: without these entries they do nothing. The page's own menus stay in its title bar.
+  const development = app.isPackaged
+    ? []
+    : [{ label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] }];
   Menu.setApplicationMenu(
-    app.isPackaged
-      ? null
-      : Menu.buildFromTemplate([
-          { label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] },
-        ]),
+    process.platform === 'darwin'
+      ? Menu.buildFromTemplate([
+          {
+            label: app.name,
+            submenu: [
+              { role: 'about', label: '关于 CC Desk Tunnel' },
+              { type: 'separator' },
+              { role: 'hide', label: '隐藏 CC Desk Tunnel' },
+              { role: 'hideOthers', label: '隐藏其他' },
+              { role: 'unhide', label: '全部显示' },
+              { type: 'separator' },
+              { role: 'quit', label: '退出 CC Desk Tunnel' },
+            ],
+          },
+          {
+            label: '编辑',
+            submenu: [
+              { role: 'undo', label: '撤销' },
+              { role: 'redo', label: '重做' },
+              { type: 'separator' },
+              { role: 'cut', label: '剪切' },
+              { role: 'copy', label: '复制' },
+              { role: 'paste', label: '粘贴' },
+              { role: 'selectAll', label: '全选' },
+            ],
+          },
+          { role: 'windowMenu', label: '窗口' },
+          ...development,
+        ])
+      : development.length
+        ? Menu.buildFromTemplate(development)
+        : null,
   );
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) =>
     callback(false),
@@ -401,9 +514,11 @@ app.whenReady().then(() => {
     minHeight: 560,
     backgroundColor: '#edf0f6',
     title: 'CC Desk Tunnel',
-    // The page draws the title bar; the system adds only its window buttons, over the bar's right end.
+    // The page draws the title bar; the system adds only its window buttons: over the bar's right end on
+    // Windows, at its left end on macOS, where the page leaves them room (see `.titlebar` in style.css).
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: '#edf0f6', symbolColor: '#22262e', height: 40 },
+    trafficLightPosition: { x: 14, y: 13 },
     icon: path.join(__dirname, 'icon.png'),
     autoHideMenuBar: true,
     show: !process.argv.includes('--smoke-test'),
@@ -438,8 +553,13 @@ app.whenReady().then(() => {
 
   // Long tasks keep running with the window closed: closing hides it, and the tray icon brings it back or quits.
   const closeToTray = () => readSettings().closeToTray !== false;
+  // The macOS menu bar takes a small shape in one colour, which it tints itself for light and dark.
   const tray = new Tray(
-    nativeImage.createFromPath(path.join(__dirname, 'icon.png')).resize({ width: 32, height: 32 }),
+    process.platform === 'darwin'
+      ? require('./tray-icon.cjs').terminalTemplate(nativeImage)
+      : nativeImage
+          .createFromPath(path.join(__dirname, 'icon.png'))
+          .resize({ width: 32, height: 32 }),
   );
   const buildMenu = () =>
     tray.setContextMenu(
@@ -468,10 +588,12 @@ app.whenReady().then(() => {
     window.hide();
     if (!readSettings().trayHintShown) {
       writeSettings({ trayHintShown: true });
-      tray.displayBalloon({
-        title: 'CC Desk Tunnel 仍在后台运行',
-        content: '点击托盘图标恢复窗口；右键图标选择“退出”才会结束连接。',
-      });
+      // Balloons are a thing of the Windows tray.
+      if (process.platform === 'win32')
+        tray.displayBalloon({
+          title: 'CC Desk Tunnel 仍在后台运行',
+          content: '点击托盘图标恢复窗口；右键图标选择“退出”才会结束连接。',
+        });
     }
   });
 });

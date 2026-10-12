@@ -1,6 +1,7 @@
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { createReadStream, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { totalmem } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingMessage, RequestListener } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
@@ -14,7 +15,12 @@ import {
 import {
   authSchema,
   commandSchema,
+  continues,
+  deviceIdentitySchema,
+  isFragment,
+  leaveSchema,
   MAX_FRAME_BYTES,
+  platformOf,
   PROTOCOL_VERSION,
   TUNNEL_CLOSE,
   tunnelAttachSchema,
@@ -24,7 +30,9 @@ import {
 import type {
   AccountState,
   Command,
+  Device,
   EventPayload,
+  Fragment,
   ServerMessage,
   Session,
   TerminalControl,
@@ -42,7 +50,7 @@ import type { NativeTerminal } from './native-terminal.ts';
 import { simulate } from './simulation.ts';
 import { SessionStore } from './store.ts';
 import { Throttle } from './throttle.ts';
-import { Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
+import { Door, Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
 import type { TunnelOptions } from './tunnel.ts';
 import { ServiceUpdates, serviceVersion } from './updates.ts';
 import type { UpdateOptions } from './updates.ts';
@@ -53,15 +61,24 @@ type Peer = {
   id: string;
   address: string;
   authenticated: boolean;
+  // The computer it is from: the name it signed in with, and the identity that follows in a frame of its own.
+  name: string;
+  device?: Device;
   tunnel?: Tunnel;
   registering: boolean;
+  // The client said it was closing the connection: nothing is kept for it to come back to.
+  left: boolean;
   subscriptions: Set<string>;
   responses: Map<string, { command: string; response: Promise<ServerMessage> }>;
 };
+// A run belongs to the computer its session is on, not to the connection that started it: connections come
+// and go with the network, and the CLI goes on working here meanwhile. `connectionId` only names the one that
+// started it, in the record.
 export type Run = {
   id: string;
   sessionId: string;
-  owner: Peer;
+  device: string;
+  connectionId: string;
   controller: AbortController;
   // Simulation keeps its single tool and approval here; native runs use `approvals` and `input`.
   toolId?: string;
@@ -70,10 +87,21 @@ export type Run = {
   decide?: (allowed: boolean, answers?: Record<string, string>) => void;
   approvals: Map<string, (allowed: boolean, answers?: Record<string, string>) => void>;
   cancelReason?: string;
+  // Output still arriving in pieces: sent on as it comes, recorded once it is whole.
+  open?: Fragment;
   input?: NativeInput;
   controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
 };
 type Terminal = { id: string; sessionId: string; owner: Peer; process?: NativeTerminal };
+// One of the user's computers, while it is connected or expected back: its connections, the door its commands
+// go through, and the wait that ends its runs if it stays away.
+type Seat = {
+  device: string;
+  peers: Set<Peer>;
+  door?: Door;
+  opening?: Promise<void>;
+  away?: NodeJS.Timeout;
+};
 type Login = { process: NativeLogin; owner: Peer; url?: string };
 type CommandOf<T extends Command['type']> = Extract<Command, { type: T }>;
 export type ServerOptions = {
@@ -88,9 +116,24 @@ export type ServerOptions = {
   host?: string;
   // Where an administrator puts the Windows installer offered to clients; defaults to <dataDir>/client.
   clientDir?: string;
+  // How many native runs and terminals may be going at once, over all connections; by default what the
+  // memory of this machine holds.
+  maxRuns?: number;
   // Following the published releases; absent, the service neither looks for nor installs newer versions.
   updates?: Omit<UpdateOptions, 'clientDir'>;
+  // How long the runs of a computer go on after its last connection broke, for it to come back to. By default
+  // five minutes with the real CLI and none in simulation.
+  graceMs?: number;
 };
+
+// How many answered requests a connection remembers, to answer a resend of one the same way.
+const REMEMBERED = 256;
+// How much unfinished output a run holds before recording it, in characters.
+const OPEN_LIMIT = 64 * 1024;
+// What the "continue" button sends in the user's place. The turn before it was stopped or cut off, and a
+// command that was under way then may or may not have taken effect.
+const CONTINUE =
+  'Continue from where the last turn stopped. A command that was running when it stopped may or may not have taken effect: check its result before repeating it.';
 
 export function createProxyServer(options: ServerOptions) {
   if (options.token.length < 24)
@@ -103,13 +146,19 @@ export function createProxyServer(options: ServerOptions) {
   const usage = new UsageLog(store.database);
   const usageReceiver = options.claude ? createUsageReceiver(usage) : undefined;
   const peers = new Set<Peer>();
-  // One run per session; the native CLI state is shared, so native work is further limited to one thing at a time:
-  // a run, a status read or session change (`mutations`), the terminal, or an account change.
+  // One run or one terminal per session, each a CLI process of its own in the session's directory. What reads
+  // or changes the state the CLI keeps for all of them — a status read or session change (`mutations`), an
+  // account change — waits until none is going.
   const runs = new Map<string, Run>();
   const mutations = new Set<string>();
-  let terminal: Terminal | undefined;
+  const terminals = new Map<string, Terminal>();
+  const seats = new Map<string, Seat>();
+  const graceMs = options.graceMs ?? (options.claude ? 300_000 : 0);
   let login: Login | undefined;
-  let tunnelOwner: Peer | undefined;
+  // Each run or terminal is a CLI process that keeps some 250 MB; more of them than the memory holds would
+  // take the machine down, and every one of them with it.
+  const capacity =
+    options.maxRuns ?? Math.max(1, Math.floor((totalmem() - 300 * 2 ** 20) / (300 * 2 ** 20)));
   // Background work that close() waits for.
   const tasks = new Set<Promise<unknown>>();
   const tunnelTasks = new Set<Promise<unknown>>();
@@ -128,8 +177,10 @@ export function createProxyServer(options: ServerOptions) {
   const releases = new ClientReleases(clientDir);
   const version = serviceVersion();
   const updates = options.updates
-    ? new ServiceUpdates({ ...options.updates, clientDir }, (state) =>
-        broadcast({ type: 'service.update', ...state }),
+    ? new ServiceUpdates(
+        // The next client of another version is offered the installer the moment it is here.
+        { ...options.updates, clientDir, installed: () => void releases.refresh() },
+        (state) => broadcast({ type: 'service.update', ...state }),
       )
     : undefined;
   const throttle = new Throttle();
@@ -206,6 +257,30 @@ export function createProxyServer(options: ServerOptions) {
         send(peer, message);
     }
   }
+  function deviceOf(peer: Peer) {
+    if (!peer.device) throw new DomainError('device_unknown', '客户端没有报告设备标识。');
+    return peer.device;
+  }
+  // A session is worked on from the computer its project directory is on. One from before computers were
+  // told apart becomes that of the first to use it.
+  function onDevice(peer: Peer, session: Session) {
+    const device = deviceOf(peer);
+    // Before computers were told apart they were all Windows ones, and so is the session's project path.
+    if (!session.device && platformOf(device) === 'win32')
+      updated(store.claim(session.id, device).id);
+    else if (session.device?.id !== device.id)
+      throw new DomainError(
+        'other_device',
+        `此会话在设备“${session.device?.name ?? '一台 Windows 电脑'}”上。要在本机接着做，请先为它选择本机的项目目录，或把它分叉到本机。`,
+      );
+  }
+  function room() {
+    if (options.claude && runs.size + terminals.size >= capacity)
+      throw new DomainError(
+        'capacity',
+        `服务端同时最多进行 ${capacity} 个运行或终端（按服务器内存估算，可用 PROXY_MAX_RUNS 调整）。请等其他任务结束后再试。`,
+      );
+  }
   function track(task: Promise<unknown>, group = tasks) {
     group.add(task);
     void task.finally(() => group.delete(task));
@@ -222,7 +297,26 @@ export function createProxyServer(options: ServerOptions) {
     broadcast({ type: 'session.event', event }, sessionId);
     return event;
   }
+  // Records what has arrived of the output the run is in the middle of.
+  function settle(run: Run) {
+    const open = run.open;
+    if (!open) return;
+    run.open = undefined;
+    record(run.sessionId, run.id, open);
+  }
   function emit(run: Run, payload: EventPayload) {
+    if (isFragment(payload)) {
+      if (run.open && !continues(run.open, payload)) settle(run);
+      run.open = run.open ? { ...run.open, text: run.open.text + payload.text } : payload;
+      broadcast(
+        { type: 'session.fragment', sessionId: run.sessionId, runId: run.id, payload },
+        run.sessionId,
+      );
+      // Very long output is recorded a part at a time, so that what is held here stays small.
+      if (run.open.text.length >= OPEN_LIMIT) settle(run);
+      return;
+    }
+    settle(run);
     record(run.sessionId, run.id, payload);
     if (payload.type === 'native.title' && store.get(run.sessionId).session.autoTitle)
       broadcast({
@@ -244,7 +338,7 @@ export function createProxyServer(options: ServerOptions) {
         exitCode: null,
       });
     }
-    emit(run, { type: 'run.status', status, reason, connectionId: run.owner.id });
+    emit(run, { type: 'run.status', status, reason, connectionId: run.connectionId });
     runs.delete(run.sessionId);
     run.controller.abort();
     run.decide?.(false);
@@ -269,12 +363,13 @@ export function createProxyServer(options: ServerOptions) {
   async function native(run: Run) {
     try {
       const { session } = store.get(run.sessionId);
-      const ssh = run.owner.tunnel!.ssh!;
-      const said = store.promptValues(run.sessionId, ssh.powershellPath);
+      const ssh = seats.get(run.device)!.door!.ssh!;
+      const said = store.promptValues(run.sessionId);
       const status = await runClaude(options.claude!, {
         sessionId: run.sessionId,
         nativeRoot: session.nativeRoot ?? session.id,
         projectPath: said.projectPath,
+        platform: said.platform,
         permissionMode: session.permissionMode,
         model: session.model,
         effort: session.effort,
@@ -284,16 +379,13 @@ export function createProxyServer(options: ServerOptions) {
           emit(run, {
             type: 'run.status',
             status: 'running',
-            connectionId: run.owner.id,
+            connectionId: run.connectionId,
             ...(background ? { waiting: 'background' as const } : {}),
           }),
         dataDir: store.directory,
         resume: store.hasNativeContext(run.sessionId),
         signal: run.controller.signal,
-        ssh: {
-          ...sessionSsh(store.directory, run.sessionId, ssh),
-          powershellPath: said.powershellPath,
-        },
+        ssh: sessionSsh(store.directory, run.sessionId, ssh),
         emit: (event) => emit(run, event),
         approve: (toolId, waiting) => {
           if (run.controller.signal.aborted) return Promise.resolve({ allowed: false });
@@ -307,7 +399,7 @@ export function createProxyServer(options: ServerOptions) {
             emit(run, {
               type: 'run.status',
               status: 'awaiting_approval',
-              connectionId: run.owner.id,
+              connectionId: run.connectionId,
               waiting,
             });
           });
@@ -349,7 +441,7 @@ export function createProxyServer(options: ServerOptions) {
       login?.process.cancel();
       return;
     }
-    if (terminal || runs.size || mutations.size)
+    if (terminals.size || runs.size || mutations.size)
       throw new DomainError('native_busy', '请先结束原生运行或终端，再管理账号。');
     const { NativeLogin, accountLogout } = await import('./native-account.ts');
     if (command.type === 'account.logout') {
@@ -402,11 +494,11 @@ export function createProxyServer(options: ServerOptions) {
     // During a run its own CLI answers, so quota can be reread without waiting for the turn to end.
     const active =
       runs.get(command.sessionId) ?? [...runs.values()].find((run) => run.controls.refresh);
-    if (active?.controls.refresh && !terminal && !mutations.size) {
+    if (active?.controls.refresh && !mutations.size) {
       await active.controls.refresh();
       return;
     }
-    if (terminal || runs.size || mutations.size)
+    if (terminals.size || runs.size || mutations.size)
       throw new DomainError('native_busy', '运行结束后再刷新原生状态。');
     mutations.add(command.sessionId);
     const controller = new AbortController();
@@ -432,7 +524,8 @@ export function createProxyServer(options: ServerOptions) {
     }
   }
   async function closeTerminal(peer: Peer, command: CommandOf<'terminal.close'>) {
-    if (!terminal || terminal.id !== command.terminalId || terminal.sessionId !== command.sessionId)
+    const terminal = terminals.get(command.sessionId);
+    if (!terminal || terminal.id !== command.terminalId)
       throw new DomainError('terminal_inactive', '原生终端已结束。');
     if (terminal.owner !== peer) throw new DomainError('not_owner', '原生终端属于另一连接。');
     await terminal.process?.close();
@@ -440,11 +533,14 @@ export function createProxyServer(options: ServerOptions) {
   // The terminal occupies its session like a run does, so other connections see it as busy.
   async function openTerminal(peer: Peer, command: CommandOf<'terminal.open'>, session: Session) {
     if (!options.claude) throw new DomainError('native_unavailable', '离线模拟不启动原生终端。');
-    if (terminal || runs.size || mutations.size)
-      throw new DomainError('native_busy', '请先结束原生运行或会话管理，再打开终端。');
-    if (!peer.tunnel?.ssh) throw new DomainError('execution_offline', 'Windows SSH 尚未就绪。');
+    if (terminals.has(command.sessionId) || runs.has(command.sessionId) || mutations.size)
+      throw new DomainError('native_busy', '请先结束这个会话的运行或会话管理，再打开终端。');
+    const ssh = peer.tunnel?.ssh && seats.get(deviceOf(peer).id)?.door?.ssh;
+    if (!ssh) throw new DomainError('execution_offline', '本机的执行通道尚未就绪。');
+    onDevice(peer, session);
+    room();
     const current: Terminal = { id: randomUUID(), sessionId: command.sessionId, owner: peer };
-    terminal = current;
+    terminals.set(current.sessionId, current);
     try {
       const { NativeTerminal, terminalArguments, terminalEnvironment } =
         await import('./native-terminal.ts');
@@ -453,11 +549,7 @@ export function createProxyServer(options: ServerOptions) {
       completeOnboarding();
       current.process = new NativeTerminal(
         options.claude.executable,
-        terminalArguments(
-          options.claude,
-          session,
-          sessionSsh(store.directory, session.id, peer.tunnel.ssh),
-        ),
+        terminalArguments(options.claude, session, sessionSsh(store.directory, session.id, ssh)),
         {
           cwd: prepareNativeDirectory(options.claude, store.directory, nativeRoot(session.id)),
           cols: command.cols,
@@ -473,7 +565,7 @@ export function createProxyServer(options: ServerOptions) {
             bytes,
           }),
         (exitCode) => {
-          if (terminal !== current) return;
+          if (terminals.get(current.sessionId) !== current) return;
           store.append(current.sessionId, current.id, {
             type: 'run.status',
             status: 'completed',
@@ -487,7 +579,7 @@ export function createProxyServer(options: ServerOptions) {
             terminalId: current.id,
             exitCode,
           });
-          terminal = undefined;
+          terminals.delete(current.sessionId);
         },
       );
       store.append(command.sessionId, current.id, {
@@ -500,7 +592,7 @@ export function createProxyServer(options: ServerOptions) {
       send(peer, { type: 'terminal.opened', sessionId: command.sessionId, terminalId: current.id });
     } catch {
       await current.process?.close();
-      if (terminal === current) terminal = undefined;
+      if (terminals.get(current.sessionId) === current) terminals.delete(current.sessionId);
       throw new DomainError('terminal_failed', '原生终端启动失败，请检查 Linux PTY 组件与 CLI。');
     }
   }
@@ -544,8 +636,9 @@ export function createProxyServer(options: ServerOptions) {
   // A fork is the native session copied under a new ID, together with the proxy's record of it. The SDK cuts
   // a copy after a message and only knows the source's message IDs, so stopping before a message takes two
   // copies: one through that message, then one of it up to the entry before its last.
-  async function fork(command: CommandOf<'session.fork'>, session: Session) {
+  async function fork(peer: Peer, command: CommandOf<'session.fork'>, session: Session) {
     if (session.activeRun) throw new DomainError('run_active', '请先结束当前运行再分叉会话。');
+    const place = { device: deviceOf(peer), projectPath: command.projectPath };
     const existing = store.created(command.requestId);
     if (existing) return existing.id;
     const before = command.beforeMessageId
@@ -585,6 +678,7 @@ export function createProxyServer(options: ServerOptions) {
         id,
         title,
         resumable,
+        place,
         before,
       );
       broadcast({ type: 'session.updated', session: created });
@@ -603,14 +697,17 @@ export function createProxyServer(options: ServerOptions) {
   // /compact command sent as a message.
   function submit(
     peer: Peer,
-    command: CommandOf<'message.send' | 'session.compact'>,
+    command: CommandOf<'message.send' | 'session.compact' | 'run.continue'>,
     session: Session,
   ) {
     if (command.type === 'session.compact' && !options.claude)
       throw new DomainError('native_unavailable', '离线模拟不提供原生上下文压缩。');
     if (command.type === 'session.compact' && !store.hasNativeContext(command.sessionId))
       throw new DomainError('native_context_missing', '先建立原生会话再压缩上下文。');
-    const text = command.type === 'session.compact' ? '/compact' : command.text;
+    const continued = command.type === 'run.continue';
+    if (continued && session.activeRun) throw new DomainError('run_active', '当前会话正在运行。');
+    const text =
+      command.type === 'session.compact' ? '/compact' : continued ? CONTINUE : command.text;
     const scenario = command.type === 'message.send' ? command.scenario : 'chat';
     // A repeated request ID is the same message arriving again, not a second message.
     const existing = store.userMessage(command.sessionId, command.requestId);
@@ -623,30 +720,31 @@ export function createProxyServer(options: ServerOptions) {
       const active = runs.get(command.sessionId);
       if (!options.claude || command.type !== 'message.send' || !active?.input)
         throw new DomainError('run_active', '当前会话正在运行。');
-      if (active.owner !== peer) throw new DomainError('not_owner', '该运行属于另一连接。');
+      if (active.device !== deviceOf(peer).id)
+        throw new DomainError('not_owner', '该运行属于另一台设备。');
       if (active.controller.signal.aborted)
         throw new DomainError('run_finishing', '原生运行正在停止，请稍后发送。');
       active.input.assertWritable();
       peer.subscriptions.add(command.sessionId);
       emit(active, { type: 'message.user', messageId: command.requestId, text, scenario });
-      active.input.submit(
-        command.requestId,
-        store.notice(command.sessionId, peer.tunnel?.ssh?.powershellPath) + text,
-      );
+      active.input.submit(command.requestId, store.notice(command.sessionId) + text);
       return;
     }
     if (options.claude && mutations.size)
       throw new DomainError('native_busy', '原生状态正在读取，请稍后发送。');
-    if (options.claude && !peer.tunnel?.ssh)
+    if (options.claude && !(peer.tunnel?.ssh && seats.get(deviceOf(peer).id)?.door?.ssh))
       throw new DomainError(
         'execution_offline',
-        'Windows SSH 尚未就绪，请通过桌面客户端重新建立连接。',
+        '本机的执行通道尚未就绪，请稍候；客户端正在建立或重新建立连接。',
       );
+    onDevice(peer, session);
+    room();
     peer.subscriptions.add(command.sessionId);
     const run: Run = {
       id: randomUUID(),
       sessionId: command.sessionId,
-      owner: peer,
+      device: deviceOf(peer).id,
+      connectionId: peer.id,
       controller: new AbortController(),
       toolFinished: false,
       approvals: new Map(),
@@ -659,23 +757,25 @@ export function createProxyServer(options: ServerOptions) {
       messageId: command.requestId,
       text,
       scenario,
+      ...(continued ? { continued } : {}),
     });
-    emit(run, { type: 'run.status', status: 'running', connectionId: run.owner.id });
+    emit(run, { type: 'run.status', status: 'running', connectionId: run.connectionId });
     // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
     // user's own text.
-    run.input?.submit(
-      command.requestId,
-      store.notice(command.sessionId, peer.tunnel?.ssh?.powershellPath) + text,
-    );
+    run.input?.submit(command.requestId, store.notice(command.sessionId) + text);
     track(
       options.claude
         ? native(run)
-        : simulate(run, command as CommandOf<'message.send'>, {
-            stepMs: options.stepMs ?? 110,
-            projectPath: () => store.get(run.sessionId).session.projectPath,
-            emit: (payload) => emit(run, payload),
-            finish: (status, reason) => finish(run, status, reason),
-          }),
+        : simulate(
+            run,
+            { ...command, type: 'message.send', text, scenario },
+            {
+              stepMs: options.stepMs ?? 110,
+              projectPath: () => store.get(run.sessionId).session.projectPath,
+              emit: (payload) => emit(run, payload),
+              finish: (status, reason) => finish(run, status, reason),
+            },
+          ),
     );
   }
   function controlRun(
@@ -685,7 +785,8 @@ export function createProxyServer(options: ServerOptions) {
     const run = runs.get(command.sessionId);
     if (!run || run.id !== command.runId)
       throw new DomainError('run_inactive', '运行已结束，操作未生效。');
-    if (run.owner !== peer) throw new DomainError('not_owner', '该运行属于另一连接。');
+    if (run.device !== deviceOf(peer).id)
+      throw new DomainError('not_owner', '该运行属于另一台设备。');
     if (command.type === 'run.task.stop') {
       if (!run.controls.stopTask) throw new DomainError('task_inactive', '后台任务已经结束。');
       // The CLI reports the task gone through its task list; a task already over is not an error.
@@ -696,7 +797,7 @@ export function createProxyServer(options: ServerOptions) {
       cancel(
         run,
         options.claude
-          ? '用户停止；已发出的 Windows SSH 命令可能继续执行，副作用未撤销，不能自动重试。'
+          ? '用户停止；已发出的 SSH 命令可能继续执行，副作用未撤销，不能自动重试。'
           : '用户停止',
       );
       return;
@@ -754,7 +855,7 @@ export function createProxyServer(options: ServerOptions) {
       case 'service.update.install':
         if (!updates) throw new DomainError('updates_unavailable', '此服务未启用版本跟踪。');
         // The restart at the end would cut these off.
-        if (terminal || runs.size || mutations.size || login)
+        if (terminals.size || runs.size || mutations.size || login)
           throw new DomainError('native_busy', '请先结束运行、终端或登录流程，再升级服务端。');
         try {
           updates.install(command.version);
@@ -772,7 +873,12 @@ export function createProxyServer(options: ServerOptions) {
         return undefined;
       }
       case 'session.create': {
-        const session = store.create(command.requestId, command.title, command.projectPath);
+        const session = store.create(
+          command.requestId,
+          command.title,
+          command.projectPath,
+          deviceOf(peer),
+        );
         peer.subscriptions.clear();
         peer.subscriptions.add(session.id);
         broadcast({ type: 'session.updated', session });
@@ -799,6 +905,17 @@ export function createProxyServer(options: ServerOptions) {
           type: 'session.snapshot',
           ...store.history(command.sessionId, command.requestId, command.afterSequence),
         });
+        // The history ends where the run's unfinished output begins.
+        {
+          const run = runs.get(command.sessionId);
+          if (run?.open)
+            send(peer, {
+              type: 'session.fragment',
+              sessionId: run.sessionId,
+              runId: run.id,
+              payload: run.open,
+            });
+        }
         return command.sessionId;
       case 'session.history':
         send(peer, {
@@ -812,8 +929,8 @@ export function createProxyServer(options: ServerOptions) {
         controlRun(peer, command);
         return command.sessionId;
     }
-    if (terminal)
-      throw new DomainError('native_busy', '原生终端打开期间，请先关闭终端再操作图形会话。');
+    if (terminals.has(command.sessionId))
+      throw new DomainError('native_busy', '这个会话的原生终端开着，请先关闭终端再操作它。');
     if (
       updates?.installing &&
       (command.type === 'message.send' || command.type === 'session.compact')
@@ -834,7 +951,7 @@ export function createProxyServer(options: ServerOptions) {
       case 'session.move':
         broadcast({
           type: 'session.updated',
-          session: store.move(command.sessionId, command.projectPath),
+          session: store.move(command.sessionId, command.projectPath, deviceOf(peer)),
         });
         break;
       case 'session.delete':
@@ -842,9 +959,10 @@ export function createProxyServer(options: ServerOptions) {
         await manageSession(command, session);
         break;
       case 'session.fork':
-        return fork(command, session);
+        return fork(peer, command, session);
       case 'message.send':
       case 'session.compact':
+      case 'run.continue':
         submit(peer, command, session);
         break;
     }
@@ -874,17 +992,25 @@ export function createProxyServer(options: ServerOptions) {
     }
     // A client of another version is told which version runs here and, if held, the installer to fetch.
     if (auth.data.protocolVersion !== PROTOCOL_VERSION) {
+      // The installer of this version may still be on its way here, or its download may have failed: the
+      // client is told how far it is and the download is started again if it is not running.
+      const held = installer();
+      if (held?.version !== version) updates?.prepareInstaller();
       send(peer, {
         type: 'connection.error',
         code: 'version_mismatch',
         message: `客户端与服务端（${version}）的版本不一致，需要升级其中一方。`,
         service: version,
-        client: installer(),
+        client: held,
+        ...(held?.version !== version && updates?.preparing
+          ? { preparing: updates.preparing }
+          : {}),
       });
       peer.socket.close(4002, 'Version mismatch');
       return false;
     }
     peer.authenticated = true;
+    peer.name = auth.data.deviceName;
     send(peer, {
       type: 'ready',
       protocolVersion: PROTOCOL_VERSION,
@@ -896,18 +1022,8 @@ export function createProxyServer(options: ServerOptions) {
       client: installer(),
       sessions: store.list(),
     });
+    // Every connection that asks has an execution channel of its own, to the computer it comes from.
     if (auth.data.tunnel && options.tunnel) {
-      if (tunnelOwner) {
-        send(peer, {
-          type: 'connection.error',
-          code: 'device_busy',
-          message:
-            '服务端已有一台 Windows 设备在线，或上一次连接还在清理。\n同一时间只支持一台设备：请先断开另一台，或等几秒后重试。',
-        });
-        peer.socket.close(4003, 'Device busy');
-        return true;
-      }
-      tunnelOwner = peer;
       peer.tunnel = new Tunnel(
         options.tunnel,
         store.directory,
@@ -971,7 +1087,8 @@ export function createProxyServer(options: ServerOptions) {
     peer.registering = true;
     track(
       peer.tunnel
-        .accept(credentials)
+        .accept(credentials, peer.device?.platform)
+        .then(() => adopt(peer))
         .then(() => {
           send(peer, { type: 'tunnel.ready', connectionId: peer.id });
         })
@@ -980,7 +1097,9 @@ export function createProxyServer(options: ServerOptions) {
             type: 'connection.error',
             code: 'ssh_failed',
             message:
-              '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。',
+              platformOf(peer.device) === 'win32'
+                ? '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。'
+                : '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：请重新连接；反复出现时在“设置 → 常规”里打开连接日志查看原因。',
           });
           peer.socket.close(4003, 'SSH probe failed');
         }),
@@ -989,13 +1108,8 @@ export function createProxyServer(options: ServerOptions) {
   }
   // Keystrokes, resizes and flow-control acknowledgments carry no request ID and get no response.
   function controlTerminal(peer: Peer, control: TerminalControl) {
-    const current = terminal;
-    if (
-      !current ||
-      current.owner !== peer ||
-      current.id !== control.terminalId ||
-      current.sessionId !== control.sessionId
-    ) {
+    const current = terminals.get(control.sessionId);
+    if (!current || current.owner !== peer || current.id !== control.terminalId) {
       send(peer, {
         type: 'connection.error',
         code: 'terminal_inactive',
@@ -1046,31 +1160,78 @@ export function createProxyServer(options: ServerOptions) {
       }),
     );
     peer.responses.set(command.requestId, { command: serialized, response });
+    // A resend follows its request closely: the latest few are all that can still be asked for again.
+    if (peer.responses.size > REMEMBERED)
+      peer.responses.delete(peer.responses.keys().next().value!);
     track(response.then((value) => send(peer, value)));
   }
-  // Whatever the connection owned ends with it; nothing is replayed for a later connection.
+  // The computer's place here, made when the first of its connections says which computer it is.
+  function enter(peer: Peer) {
+    const device = deviceOf(peer).id;
+    let seat = seats.get(device);
+    if (!seat) {
+      seat = { device, peers: new Set() };
+      seats.set(device, seat);
+      if (options.tunnel) {
+        seat.door = new Door(options.tunnel, store.directory, device);
+        seat.opening = seat.door.start();
+        seat.opening.catch(() => {});
+      }
+    }
+    clearTimeout(seat.away);
+    seat.away = undefined;
+    seat.peers.add(peer);
+    return seat;
+  }
+  // The device's commands go through this connection's tunnel from now on: the newest that is ready.
+  async function adopt(peer: Peer) {
+    if (!peer.device || !peer.tunnel?.ssh) return;
+    const seat = seats.get(peer.device.id);
+    if (!seat?.door) return;
+    await seat.opening;
+    if (peers.has(peer) && seat.peers.has(peer)) seat.door.use(peer.tunnel);
+  }
+  // Nothing more is kept for a computer: its runs end and its door closes.
+  function vacate(seat: Seat, reason: string) {
+    clearTimeout(seat.away);
+    if (seats.get(seat.device) !== seat) return;
+    seats.delete(seat.device);
+    for (const run of runs.values()) if (run.device === seat.device) cancel(run, reason);
+    if (seat.door) track(seat.door.close(), tunnelTasks);
+  }
+  // What belongs to the connection itself ends with it: its terminal, a sign-in it began, its tunnel. The runs
+  // of its computer go on. If no other connection of that computer is here they are given `graceMs` for one
+  // to come back, unless the client said it was leaving; nothing is replayed for a later connection either way.
   function release(peer: Peer) {
     peers.delete(peer);
     if (login?.owner === peer) login.process.cancel();
-    if (terminal?.owner === peer) {
-      const task = terminal.process?.close();
-      if (task) track(task);
+    for (const terminal of terminals.values())
+      if (terminal.owner === peer) {
+        const task = terminal.process?.close();
+        if (task) track(task);
+      }
+    const seat = peer.device && seats.get(peer.device.id);
+    if (seat?.peers.delete(peer)) {
+      if (seat.door?.uses(peer.tunnel))
+        seat.door.use([...seat.peers].findLast((other) => other.tunnel?.ssh)?.tunnel);
+      if (!seat.peers.size) {
+        const waiting = [...runs.values()].some((run) => run.device === seat.device);
+        const gone = options.claude
+          ? '连接断开，运行未重放；在途命令结果可能未知。'
+          : '连接断开，运行未重放。';
+        if (peer.left || !waiting || !graceMs) vacate(seat, gone);
+        else
+          seat.away = setTimeout(
+            () =>
+              vacate(
+                seat,
+                `设备离线超过 ${Math.round(graceMs / 1000)} 秒，运行已停止；在途命令结果可能未知。`,
+              ),
+            graceMs,
+          );
+      }
     }
-    for (const run of runs.values())
-      if (run.owner === peer)
-        cancel(
-          run,
-          options.claude
-            ? '连接断开，运行未重放；在途命令结果可能未知。'
-            : '连接断开，运行未重放。',
-        );
-    if (peer.tunnel)
-      track(
-        peer.tunnel.close().finally(() => {
-          if (tunnelOwner === peer) tunnelOwner = undefined;
-        }),
-        tunnelTasks,
-      );
+    if (peer.tunnel) track(peer.tunnel.close(), tunnelTasks);
   }
 
   wss.on('connection', (socket: WebSocket, address: string) => {
@@ -1080,11 +1241,14 @@ export function createProxyServer(options: ServerOptions) {
       id: randomUUID(),
       address,
       authenticated: false,
+      name: '',
       registering: false,
+      left: false,
       subscriptions: new Set(),
       responses: new Map(),
     };
     peers.add(peer);
+    const opened = Date.now();
     const authTimer = setTimeout(() => socket.close(4001, 'Authentication timeout'), 5000);
     // A long unattended run should survive a brief network stall: only two pings in a row without an answer,
     // about 45 seconds of silence, end the connection.
@@ -1092,6 +1256,7 @@ export function createProxyServer(options: ServerOptions) {
     let timedOut = false;
     // Whether this connection still holds one of the places for those that have not signed in.
     let signedIn = false;
+    let greeted = false;
     socket.on('pong', () => {
       missed = 0;
     });
@@ -1120,6 +1285,9 @@ export function createProxyServer(options: ServerOptions) {
         return;
       }
       if (!peer.authenticated) {
+        // Only the first frame signs in. What a refused client sent after it is not another attempt.
+        if (greeted) return;
+        greeted = true;
         const channel = (value as { type?: unknown } | null)?.type === 'tunnel.attach';
         if (channel ? attachChannel(peer, value) : authenticate(peer, value)) {
           clearTimeout(authTimer);
@@ -1131,6 +1299,28 @@ export function createProxyServer(options: ServerOptions) {
       const credentials = tunnelCredentialsSchema.safeParse(value);
       if (credentials.success) {
         registerTunnel(peer, credentials.data);
+        return;
+      }
+      const identity = deviceIdentitySchema.safeParse(value);
+      if (identity.success) {
+        peer.device = {
+          id: identity.data.id,
+          name: peer.name,
+          ...(identity.data.platform ? { platform: identity.data.platform } : {}),
+        };
+        // With the line written when it closes, this tells which computer a connection was and how long it held.
+        if (!closing)
+          console.log(
+            `Connection ${peer.id.slice(0, 8)} opened: device "${peer.name}" (${identity.data.id.slice(0, 8)}) from ${address}`,
+          );
+        for (const session of store.named(peer.device))
+          broadcast({ type: 'session.updated', session });
+        enter(peer);
+        track(adopt(peer), tunnelTasks);
+        return;
+      }
+      if (leaveSchema.safeParse(value).success) {
+        peer.left = true;
         return;
       }
       const control = terminalControlSchema.safeParse(value);
@@ -1154,12 +1344,16 @@ export function createProxyServer(options: ServerOptions) {
       clearInterval(heartbeat);
       if (!signedIn) throttle.leave(address);
       // Why a connection ended is the first thing needed when a run was cut short.
-      const owned = [...runs.values()].filter((run) => run.owner === peer).length;
+      const device = peer.device?.id;
+      const before = [...runs.values()].filter((run) => run.device === device).length;
+      release(peer);
+      // A native run that is being ended takes a moment to go: what became of the runs is told by whether the
+      // computer still has a place here.
+      const seat = device ? seats.get(device) : undefined;
       if (peer.authenticated && !closing)
         console.log(
-          `Connection ${peer.id.slice(0, 8)} closed: ${timedOut ? 'no heartbeat answer for 45s' : `code ${code}`}; runs ended with it: ${owned}`,
+          `Connection ${peer.id.slice(0, 8)} closed after ${Math.round((Date.now() - opened) / 1000)} s: ${peer.left ? 'the client left' : timedOut ? 'no heartbeat answer for 45s' : `code ${code}`}; runs of its device: ${before}${!before ? '' : !seat ? ', ended' : seat.away ? `, kept for ${Math.round(graceMs / 1000)} s` : ', going on over another connection'}`,
         );
-      release(peer);
     });
   });
   return {
@@ -1184,9 +1378,15 @@ export function createProxyServer(options: ServerOptions) {
       closing = true;
       updates?.stop();
       login?.process.cancel();
-      const terminalCleanup = terminal?.process?.close();
+      const terminalCleanup = Promise.all(
+        [...terminals.values()].map((terminal) => terminal.process?.close()),
+      );
       for (const run of runs.values()) cancel(run, '服务停止，运行未重放。');
-      const cleanup = [...peers].map((peer) => peer.tunnel?.close());
+      for (const seat of seats.values()) clearTimeout(seat.away);
+      const cleanup = [
+        ...[...peers].map((peer) => peer.tunnel?.close()),
+        ...[...seats.values()].map((seat) => seat.door?.close()),
+      ];
       for (const peer of peers) peer.socket.terminate();
       await Promise.all([...tasks]);
       await terminalCleanup;

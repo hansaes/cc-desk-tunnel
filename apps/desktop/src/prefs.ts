@@ -14,11 +14,15 @@ export type Prefs = {
   pinnedProjects: string[];
   // Projects whose sessions are folded away in the sidebar.
   collapsedProjects: string[];
+  // Whether the sessions on the user's other computers are listed in the sidebar.
+  elsewhereOpen: boolean;
   projectNames: Record<string, string>;
   notify: { enabled: boolean; sound: boolean } & Record<NotifyKind, boolean>;
   // `keys` holds only what the user changed, by action; an empty combination means none.
   shortcuts: { enabled: boolean; keys: Record<string, string> };
   connection: ConnectionWaits;
+  // Whether the approval modes include the one that asks about nothing.
+  bypassPermissions: boolean;
 };
 
 const storageKey = 'proxy-prefs';
@@ -26,6 +30,7 @@ const defaults: Prefs = {
   pinnedSessions: [],
   pinnedProjects: [],
   collapsedProjects: [],
+  elsewhereOpen: false,
   projectNames: {},
   notify: {
     enabled: true,
@@ -39,6 +44,7 @@ const defaults: Prefs = {
   },
   shortcuts: { enabled: true, keys: {} },
   connection: connectionWaits,
+  bypassPermissions: false,
 };
 
 function read(): Prefs {
@@ -50,6 +56,7 @@ function read(): Prefs {
       pinnedSessions: strings(saved.pinnedSessions),
       pinnedProjects: strings(saved.pinnedProjects),
       collapsedProjects: strings(saved.collapsedProjects),
+      elsewhereOpen: saved.elsewhereOpen === true,
       projectNames:
         saved.projectNames && typeof saved.projectNames === 'object' ? saved.projectNames : {},
       notify: { ...defaults.notify, ...(typeof saved.notify === 'object' ? saved.notify : {}) },
@@ -72,6 +79,7 @@ function read(): Prefs {
           ];
         }),
       ) as ConnectionWaits,
+      bypassPermissions: saved.bypassPermissions === true,
     };
   } catch {
     return defaults;

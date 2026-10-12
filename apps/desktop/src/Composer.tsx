@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowUp, Folder, GitBranch, Plus, RefreshCw, Shrink, Square } from 'lucide-react';
+import { ArrowUp, Folder, GitBranch, Play, Plus, RefreshCw, Shrink, Square } from 'lucide-react';
 import type {
   Effort,
   NativeCapabilities,
@@ -63,6 +63,7 @@ export default function Composer({
   nativeSession,
   metrics,
   send,
+  resume,
   compact,
   refresh,
   configure,
@@ -92,6 +93,8 @@ export default function Composer({
   nativeSession: NativeSession | null;
   metrics: NativeMetrics | null;
   send: () => void;
+  // Present when the session's last turn was stopped or cut off: takes it up again without a message.
+  resume?: () => void;
   compact: () => void;
   refresh: () => void;
   configure: (values: {
@@ -115,15 +118,36 @@ export default function Composer({
   function attach(paths: string[]) {
     if (!paths.length) return;
     const box = input.current;
-    const at = box ? box.selectionStart : draft.length;
-    const before = draft.slice(0, at);
+    // The box holds what is typed right now; a picture is attached a moment after it was pasted.
+    const current = box ? box.value : draft;
+    const at = box ? box.selectionStart : current.length;
+    const before = current.slice(0, at);
     const text = paths.map((path) => `"${path}"`).join(' ');
     const lead = before && !/\s$/.test(before) ? ' ' : '';
-    setDraft(`${before}${lead}${text} ${draft.slice(at)}`);
+    setDraft(`${before}${lead}${text} ${current.slice(at)}`);
     box?.focus();
   }
-  const paths = (files: FileList) =>
-    [...files].map((file) => window.desktop!.pathForFile(file)).filter(Boolean);
+  const shown = useRef(session.id);
+  shown.current = session.id;
+  // Files copied in Explorer have a path. A picture that is only on the clipboard (a screenshot, an image
+  // copied from a page) has none: the client saves it on this computer and its path is attached like any other.
+  async function paste(files: File[]) {
+    const pasted = session.id;
+    const found: string[] = [];
+    for (const file of files) {
+      const path = window.desktop!.pathForFile(file);
+      if (path) found.push(path);
+      else if (file.type.startsWith('image/'))
+        try {
+          found.push(
+            await window.desktop!.saveImage(file.type, new Uint8Array(await file.arrayBuffer())),
+          );
+        } catch {
+          // A picture that could not be saved is left out; the rest is still attached.
+        }
+    }
+    if (shown.current === pasted) attach(found);
+  }
   return (
     <div className="composer-area">
       {native && slashOpen && (
@@ -201,7 +225,7 @@ export default function Composer({
           setDropping(false);
           if (!window.desktop || inputDisabled || !event.dataTransfer.files.length) return;
           event.preventDefault();
-          attach(paths(event.dataTransfer.files));
+          void paste([...event.dataTransfer.files]);
         }}
       >
         <textarea
@@ -217,12 +241,17 @@ export default function Composer({
             setSlashOpen(native && slashDraft.test(event.target.value));
           }}
           onPaste={(event) => {
-            // Files copied in Explorer arrive as files; pasted text is left to the browser.
+            // Pasted text is left to the browser, also when a program put a picture of it beside the text.
             if (!window.desktop || !event.clipboardData.files.length) return;
-            const found = paths(event.clipboardData.files);
-            if (!found.length) return;
+            const files = [...event.clipboardData.files];
+            const text = event.clipboardData.getData('text/plain');
+            const usable = files.filter(
+              (file) =>
+                window.desktop!.pathForFile(file) || (!text && file.type.startsWith('image/')),
+            );
+            if (!usable.length) return;
             event.preventDefault();
-            attach(found);
+            void paste(usable);
           }}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
@@ -295,16 +324,22 @@ export default function Composer({
               <Square />
             </IconButton>
           )}
-          {(!session.activeRun || native) && (
-            <button
-              type="submit"
-              className="icon-button send-button"
-              aria-label="发送消息"
-              title="发送消息"
-              disabled={!draft.trim() || inputDisabled}
-            >
-              <ArrowUp />
-            </button>
+          {resume && !draft.trim() ? (
+            <IconButton title="接着上一轮继续" className="send-button" onClick={resume}>
+              <Play />
+            </IconButton>
+          ) : (
+            (!session.activeRun || native) && (
+              <button
+                type="submit"
+                className="icon-button send-button"
+                aria-label="发送消息"
+                title="发送消息"
+                disabled={!draft.trim() || inputDisabled}
+              >
+                <ArrowUp />
+              </button>
+            )
           )}
         </div>
       </form>
