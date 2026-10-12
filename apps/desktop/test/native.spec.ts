@@ -107,6 +107,13 @@ test('official subscription: account metrics, Windows execution, running input, 
     const marker = `PRO-STREAM-${Date.now()}`;
     await rename(page, marker);
 
+    await expect(page.locator('.quota-chip')).not.toHaveCount(0);
+    await expect(page.locator('.quota-chip').first()).toHaveText(/^[时周] \d+%$/);
+    await page.locator('.quota-chip').first().hover();
+    await expect(page.getByRole('tooltip')).toContainText('剩余');
+    await expect(page.getByRole('tooltip')).toContainText('本周期');
+    await page.mouse.move(10, 10);
+
     await page.getByRole('button', { name: '设置与账号', exact: true }).click();
     await page.getByRole('menuitem', { name: /^账号/ }).click();
     const account = page.getByRole('region', { name: '账号信息' });

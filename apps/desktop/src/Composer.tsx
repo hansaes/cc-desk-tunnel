@@ -6,10 +6,13 @@ import type {
   NativeMetrics,
   NativeSession,
   PermissionMode,
+  RateLimits,
   Session,
 } from '@cc-desk-tunnel/protocol';
 import ComposerControls from './ComposerControls.tsx';
 import PermissionMenu from './PermissionMenu.tsx';
+import QuotaChips from './QuotaChips.tsx';
+import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
 import type { MenuPosition } from './ui.tsx';
 
@@ -41,6 +44,7 @@ function useBranch(path: string, running: boolean) {
 }
 
 export default function Composer({
+  client,
   session,
   projectName,
   chooseProject,
@@ -62,6 +66,8 @@ export default function Composer({
   capabilities,
   nativeSession,
   metrics,
+  quota,
+  openAccount,
   send,
   resume,
   compact,
@@ -69,6 +75,7 @@ export default function Composer({
   configure,
   stop,
 }: {
+  client: ProxyClient;
   session: Session;
   // Absent for a session that belongs to no project.
   projectName: string | null;
@@ -92,6 +99,9 @@ export default function Composer({
   capabilities: NativeCapabilities | null;
   nativeSession: NativeSession | null;
   metrics: NativeMetrics | null;
+  // The account's subscription quota, from whichever session read it last; absent until it is read.
+  quota: RateLimits | null;
+  openAccount: () => void;
   send: () => void;
   // Present when the session's last turn was stopped or cut off: takes it up again without a message.
   resume?: () => void;
@@ -298,6 +308,8 @@ export default function Composer({
               change={(permissionMode) => void configure({ permissionMode })}
             />
           )}
+          <span className="toolbar-space" />
+          <QuotaChips client={client} quota={quota} open={openAccount} />
           <span className="toolbar-space" />
           {native && (
             <ComposerControls

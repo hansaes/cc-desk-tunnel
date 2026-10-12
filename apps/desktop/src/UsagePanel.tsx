@@ -21,6 +21,25 @@ export const tokens = (value: number) =>
   value < 10000 ? value.toLocaleString('zh-CN') : compact.format(value);
 export const dollars = (value: number) =>
   `$${value >= 100 ? value.toFixed(0) : value >= 1 ? value.toFixed(2) : value.toFixed(value >= 0.01 || value === 0 ? 2 : 4)}`;
+// The totals of each quota period, for whoever shows a window's usage. `key` is what makes it read again —
+// a fresh quota reading, which is what cuts the periods — and `null` while there is nothing to ask about.
+export function useUsageSummary(client: ProxyClient, key: string | null) {
+  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  useEffect(() => {
+    if (key === null) return;
+    let current = true;
+    void client.fetch({ type: 'usage.summary' }).then(
+      (result) => {
+        if (current) setSummary(result);
+      },
+      () => {},
+    );
+    return () => {
+      current = false;
+    };
+  }, [client, key]);
+  return summary;
+}
 const seconds = (ms: number | null) =>
   ms == null ? '—' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
 const total = (item: {

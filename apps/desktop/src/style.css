@@ -1762,6 +1762,64 @@ details[open] > summary > .fold-chevron {
   border-radius: 50%;
   color: var(--text);
 }
+.quota-chips {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.quota-control {
+  position: relative;
+  min-width: 0;
+}
+/* Centred on its chip, which sits in the middle of the toolbar rather than at either end. */
+.quota-tooltip {
+  bottom: calc(100% + 9px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 258px;
+  padding: 13px 15px;
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+}
+/* Wraps between the figures rather than inside one of them. */
+.quota-period-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+}
+.quota-tooltip small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.quota-chip {
+  background: var(--surface-2);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.quota-chip::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.quota-chip.warn::before {
+  background: var(--warn);
+}
+.quota-chip.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.quota-chip.danger::before {
+  background: var(--danger);
+}
+/* Written to outweigh the hover of a plain chip, which would otherwise grey the warning out. */
+button.chip.quota-chip.danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 .composer-controls {
   display: flex;
   align-items: center;
@@ -1807,6 +1865,7 @@ details[open] > summary > .fold-chevron {
   stroke: var(--danger);
 }
 .context-tooltip,
+.quota-tooltip,
 .model-menu,
 .slash-menu,
 .permission-menu {

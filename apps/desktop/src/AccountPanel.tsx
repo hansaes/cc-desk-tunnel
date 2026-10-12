@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   UserRound,
   RefreshCw,
@@ -11,13 +11,8 @@ import {
   Check,
   ListOrdered,
 } from 'lucide-react';
-import type {
-  AccountState,
-  NativeCapabilities,
-  NativeMetrics,
-  UsageSummary,
-} from '@cc-desk-tunnel/protocol';
-import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
+import type { AccountState, NativeCapabilities, NativeMetrics } from '@cc-desk-tunnel/protocol';
+import UsagePanel, { dollars, quotaName, tokens, useUsageSummary } from './UsagePanel.tsx';
 import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
 import { copyText } from './copy.tsx';
@@ -48,20 +43,9 @@ export default function AccountPanel({
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [copied, setCopied] = useState(false);
   const signedOut = state?.loggedIn === false;
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [log, setLog] = useState<string | null>(null);
-  useEffect(() => {
-    let current = true;
-    void client.fetch({ type: 'usage.summary' }).then(
-      (result) => {
-        if (current) setSummary(result);
-      },
-      () => {},
-    );
-    return () => {
-      current = false;
-    };
-  }, [client, metrics?.rateLimits?.measuredAt, log]);
+  // Coming back from the call log reads the totals again: browsing it may have added records.
+  const summary = useUsageSummary(client, `${metrics?.rateLimits?.measuredAt ?? ''}:${log ?? ''}`);
   if (log)
     return <UsagePanel client={client} summary={summary} initial={log} back={() => setLog(null)} />;
   async function act(command: Parameters<ProxyClient['request']>[0]) {

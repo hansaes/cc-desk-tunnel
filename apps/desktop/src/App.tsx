@@ -1368,6 +1368,7 @@ export function App() {
             )}
             {selected && !away && !terminalSessionId && (
               <Composer
+                client={client}
                 session={selected}
                 projectName={
                   isInside(selected.projectPath, workspaceRoots)
@@ -1397,6 +1398,8 @@ export function App() {
                 capabilities={capabilities}
                 nativeSession={nativeSession}
                 metrics={metrics}
+                quota={signedOut ? null : (accountMetrics?.rateLimits ?? null)}
+                openAccount={() => open('settings', 'account')}
                 send={() => {
                   void send();
                 }}

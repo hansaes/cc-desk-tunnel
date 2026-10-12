@@ -99,6 +99,7 @@ export const rateLimitsSchema = z.object({
   ),
   measuredAt: timestamp.optional(),
 });
+export type RateLimits = z.infer<typeof rateLimitsSchema>;
 const usageTotals = {
   requests: z.number().int().nonnegative(),
   inputTokens: z.number().nonnegative(),
