@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN userdel -r ubuntu && useradd --uid 1000 --create-home --shell /bin/bash ccdesktunnel
 
 FROM base AS build
+# Legacy Docker builders create WORKDIR as root, even after USER.
+RUN install -d -o ccdesktunnel -g ccdesktunnel /app
 COPY scripts/install-linux.sh /tmp/install-linux.sh
 USER ccdesktunnel
 RUN CC_DESK_TUNNEL_RUNTIME=/home/ccdesktunnel/runtime bash /tmp/install-linux.sh
@@ -34,7 +36,9 @@ COPY deploy/docker/entrypoint.sh /usr/local/bin/proxy-entrypoint
 COPY deploy/docker/healthcheck.mjs /app/healthcheck.mjs
 # What a release needs from this image; a program installed from the client must not ask for more.
 COPY deploy/docker/runtime-level /opt/runtime/level
-RUN chmod 755 /usr/local/bin/proxy-entrypoint && mkdir /data && chown ccdesktunnel:ccdesktunnel /data
+# The working directory is made here with its owner: a builder without BuildKit makes the one WORKDIR names as root.
+RUN chmod 755 /usr/local/bin/proxy-entrypoint && mkdir -p /data/workspace \
+    && chown -R ccdesktunnel:ccdesktunnel /data
 ENV PATH=/opt/runtime/node/bin:/opt/runtime/cli/bin:$PATH \
     HOME=/data/home
 USER ccdesktunnel

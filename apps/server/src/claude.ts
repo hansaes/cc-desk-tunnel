@@ -57,6 +57,15 @@ export type ClaudeRun = {
   ssh: SshConnection;
   // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
   waiting: (background: boolean) => void;
+  // Told when a turn ends: the user message it answered, its time window, and how many model requests it made.
+  turnEnded: (turn: {
+    messageId?: string;
+    startedAt: number;
+    endedAt: number;
+    requests: number;
+    outputTokens: number;
+    promptIds: string[];
+  }) => void;
   // Filled in while the CLI is running, so the service can ask it for fresh account quota mid-run and end
   // one of its background tasks.
   controls: { refresh?: () => Promise<void>; stopTask?: (taskId: string) => Promise<void> };
@@ -125,6 +134,11 @@ export async function runClaude(
   let stderr = '',
     failure: Error | undefined;
   let session: Query | undefined;
+  // The prompts the CLI took since the last turn ended; the OpenTelemetry records of their requests carry the same ids.
+  let promptIds: string[] = [];
+  // Output tokens of every model call so far, subagents included, as the CLI's running total counts them; a turn's
+  // share is the step from one result to the next. A resumed session's total already holds earlier runs.
+  let outputSoFar: number | undefined = run.resume ? undefined : 0;
   let settle: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
   try {
@@ -153,6 +167,19 @@ export async function runClaude(
         extraArgs: thinkingShown() ? { 'thinking-display': 'summarized' } : {},
         settings: options.settingsPath,
         settingSources: ['user', 'project', 'local'],
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                async (input) => {
+                  if (input.hook_event_name === 'UserPromptSubmit' && input.prompt_id)
+                    promptIds.push(input.prompt_id);
+                  return {};
+                },
+              ],
+            },
+          ],
+        },
         maxTurns: options.maxTurns,
         env: { ...process.env, ...options.environment },
         stderr: (text) => {
@@ -182,14 +209,26 @@ export async function runClaude(
       },
     });
     const initialized = await session.initializationResult();
-    run.emit(
-      nativeCapabilities(
+    // The commands change while the run goes on: each turn's `init` names those bound to the CLI's terminal, and
+    // skills found on the way bring a new list. A change is passed on once.
+    let commands = initialized.commands;
+    let terminal: string[] = [];
+    let offered = '';
+    const offer = () => {
+      const payload = nativeCapabilities(
         initialized.models,
         initialized.account,
-        initialized.commands.map((command) => command.name),
+        commands,
         run.model ?? options.model,
-      ),
-    );
+        terminal,
+      );
+      const key =
+        payload.type === 'native.capabilities' ? JSON.stringify(payload.commandDetails) : '';
+      if (key === offered || run.signal.aborted) return;
+      offered = key;
+      run.emit(payload);
+    };
+    offer();
     let metrics: NativeMetrics | undefined;
     let refresh: Promise<void> | undefined;
     let refreshedAt = 0;
@@ -208,10 +247,40 @@ export async function runClaude(
     let background = 0;
     let idle = false;
     let told = false;
+    let turnStartedAt = Date.now();
+    // What each background task last said of itself, and when it was passed on.
+    const progress = new Map<string, { said: string; at: number }>();
     for await (const message of session) {
+      if (message.type === 'system' && message.subtype === 'init') {
+        terminal = message.terminal_slash_commands ?? [];
+        offer();
+      }
+      if (message.type === 'system' && message.subtype === 'commands_changed') {
+        commands = message.commands;
+        offer();
+      }
+      if (message.type === 'system' && message.subtype === 'task_progress' && !run.signal.aborted) {
+        const tool = message.last_tool_name?.slice(0, 100);
+        const summary = message.summary?.slice(0, 300);
+        const said = `${tool}\n${summary}`;
+        const last = progress.get(message.task_id);
+        // A task reports every few moments; the same word again is passed on at most every two seconds.
+        if (!last || last.said !== said || Date.now() - last.at >= 2000) {
+          progress.set(message.task_id, { said, at: Date.now() });
+          run.emit({
+            type: 'native.progress',
+            taskId: message.task_id,
+            tool,
+            toolUses: message.usage.tool_uses,
+            summary,
+          });
+        }
+      }
       if (message.type === 'system' && message.subtype === 'background_tasks_changed') {
         const tasks = message.tasks.filter((task) => !task.ambient);
         background = tasks.length;
+        for (const id of progress.keys())
+          if (!tasks.some((task) => task.task_id === id)) progress.delete(id);
         if (!run.signal.aborted)
           run.emit({
             type: 'native.tasks',
@@ -269,8 +338,33 @@ export async function runClaude(
           });
       }
       if (message.type === 'result') {
+        const endedAt = Date.now();
         await refresh;
         const done = run.input.endTurn(message, background > 0);
+        const outputTotal = Object.values(message.modelUsage ?? {}).reduce(
+          (sum, model) => sum + model.outputTokens,
+          0,
+        );
+        const turnOutput =
+          outputSoFar === undefined || outputTotal < outputSoFar
+            ? (message.usage?.output_tokens ?? 0)
+            : outputTotal - outputSoFar;
+        outputSoFar = outputTotal;
+        if (!run.signal.aborted) {
+          // A turn that merged several messages answers them all; the last one is where the reply is shown.
+          const answered = message.user_message_uuids ?? [message.user_message_uuid];
+          run.turnEnded({
+            messageId: answered.filter((id) => id).at(-1),
+            startedAt: turnStartedAt,
+            endedAt,
+            requests: mapper.requests,
+            outputTokens: turnOutput,
+            promptIds,
+          });
+        }
+        turnStartedAt = endedAt;
+        mapper.requests = 0;
+        promptIds = [];
         if (!run.signal.aborted) {
           try {
             const payload = await nativeMetrics(session, message);
@@ -378,7 +472,7 @@ export async function readNativeStatus(
       nativeCapabilities(
         initialized.models,
         initialized.account,
-        initialized.commands.map((command) => command.name),
+        initialized.commands,
         options.model,
       ),
       await nativeMetrics(process),

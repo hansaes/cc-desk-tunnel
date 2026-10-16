@@ -478,23 +478,50 @@ test('a session on another computer is listed apart, read, and taken over with a
   const row = other.locator('.session-row').filter({ hasText: title });
   await expect(row).toHaveCount(0);
   await other.getByRole('button', { name: '展开其他设备的会话', exact: true }).click();
+  // Under the other computer its sessions stand by project, as they do on their own computer.
+  await expect(
+    other
+      .locator('.elsewhere-project:has-text("中文项目") + .session-row')
+      .filter({ hasText: title }),
+  ).toHaveCount(1);
   await row.click();
   await expect(other.getByText('第一台电脑上的话')).toBeVisible();
   const bar = other.locator('.elsewhere-bar');
   await expect(bar).toContainText('浏览器');
-  await expect(other.locator('.composer')).toHaveCount(0);
+  // The first computer is connected: the session can be worked on from here, running there.
+  await expect(bar).toContainText('在这里发的消息');
+  await expect(other.locator('.composer')).toBeVisible();
   await other.screenshot({ path: resolve(screenshots, 'desktop-elsewhere.png') });
   other.once('dialog', (dialog) => void dialog.accept('E:\\另一台\\接管目录'));
   await bar.getByRole('button', { name: '在本机继续…', exact: true }).click();
+  // A computer that already has projects offers them first; the folder is then chosen from that list.
+  const elsewhere = other.getByRole('menuitem', { name: '选择其他文件夹…', exact: true });
+  if (await elsewhere.isVisible()) await elsewhere.click();
   await expect(bar).toHaveCount(0);
   await expect(
-    other.locator('.project-group').filter({ hasText: '接管目录' }).locator('.session-row'),
+    // The other computers' group names folders as well; a project here is told by its own heading.
+    other
+      .locator('.project-group')
+      .filter({ has: other.locator('h2', { hasText: '接管目录' }) })
+      .locator('.session-row'),
   ).toHaveCount(1);
   await send(other, '第二台电脑上的话');
   await settled(other);
   // The computer it was taken from still has it open, and now as one of another's.
   await expect(page.locator('.elsewhere-bar')).toContainText('接管目录');
   await expect(page.getByText('第二台电脑上的话')).toBeVisible();
+  // This computer has projects, so the session comes back into one of them without a folder being asked for.
+  await page.locator('.elsewhere-bar').getByRole('button', { name: '在本机继续…' }).click();
+  const menu = page.getByRole('menu', { name: '会话所在的项目' });
+  await expect(menu).toContainText('这台电脑上的项目');
+  const choice = menu.getByRole('menuitemradio', { name: /中文项目/ });
+  await expect(choice).toHaveAttribute('aria-checked', 'false');
+  await expect(menu.getByRole('menuitem', { name: '选择其他文件夹…' })).toBeVisible();
+  await choice.click();
+  await expect(page.locator('.elsewhere-bar')).toHaveCount(0);
+  await expect(
+    page.locator('.project-group').filter({ hasText: '中文项目' }).locator('.session-row.selected'),
+  ).toContainText(title);
   await context.close();
 });
 
@@ -640,8 +667,9 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
     // The schedule file exists from the first launch, and an edit made outside the window reaches it,
     // byte-order mark or not.
     const file = resolve(profile, 'schedules.json');
-    // The window reads the file itself as it starts; the edit below has to come after that.
-    await expect(page.getByLabel('服务凭据')).toBeVisible();
+    // The window reads the file itself as it starts; the edit below has to come after that. It signs in by
+    // itself here, so whichever of the two pages is up tells that it has started.
+    await expect(page.locator('.login-page, .shell')).toBeVisible();
     const loaded = await page.evaluate(() => window.desktop!.loadSchedules(''));
     expect(loaded.path).toBe(file);
     expect(JSON.parse(loaded.text).tasks).toEqual([]);

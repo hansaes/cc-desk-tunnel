@@ -363,6 +363,9 @@ test('a run that goes on only for background tasks looks finished, lists them an
   await row.locator('.session-select').click();
   const panel = page.locator('.background-tasks');
   await expect(panel.getByRole('status')).toContainText('后台任务 2 个');
+  // Why the model, the approval mode and forking are greyed out while the tasks go on.
+  await expect(panel).toContainText('任务结束前不能更改模型');
+  await expect(panel).toContainText('消息可以照常发送');
   await expect(panel.getByRole('listitem')).toHaveText([/完整渲染/, /开发服务器/]);
   // The turn itself is over: its answer shows as final, and the composer offers sending, not stopping.
   await expect(page.locator('.message.assistant')).toContainText('渲染已在后台开始。');
@@ -607,6 +610,50 @@ test('Electron: frameless window, the project branch, files by path and window s
       return window.getContentSize()[1] === window.getSize()[1];
     });
     expect(frame).toBe(true);
+    // The developer tools open from the settings page only: no menu and no shortcut of the page does it.
+    const tools = () =>
+      application.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0].webContents.isDevToolsOpened(),
+      );
+    await page.keyboard.press('Control+Shift+KeyI');
+    await page.keyboard.press('F12');
+    expect(await tools()).toBe(false);
+    await page
+      .getByRole('navigation', { name: '设置分类' })
+      .getByRole('button', { name: '关于与更新', exact: true })
+      .click();
+    await page.getByRole('button', { name: '打开开发者工具', exact: true }).click();
+    await expect.poll(tools).toBe(true);
+    // What this version changed is read here, from the notes the program carries.
+    await page.getByRole('button', { name: '这一版的更新内容', exact: true }).click();
+    const notes = page.getByRole('dialog');
+    await expect(notes.getByRole('heading', { name: /的更新内容$/ })).toBeVisible();
+    await expect(notes).toContainText('升级说明');
+    // A link into the repository goes to that file on GitHub (see notes-quota.test.mjs), and from there to the
+    // user's browser: whatever this version's notes link to, no link is left relative to the program's page.
+    expect(
+      await notes
+        .locator('.release-notes a')
+        .evaluateAll((links) =>
+          links
+            .map((link) => link.getAttribute('href') ?? '')
+            .filter((href) => !/^(https?:|mailto:|#)/.test(href)),
+        ),
+    ).toEqual([]);
+    // The notes wrap inside their dialog and scroll downwards only.
+    expect(
+      await notes.evaluate((dialog) =>
+        [dialog, dialog.querySelector('.release-notes')!].every(
+          (box) => box.scrollWidth <= box.clientWidth,
+        ),
+      ),
+    ).toBe(true);
+    // The picture is for the eye; one that is open in a viewer cannot be written over.
+    await page
+      .screenshot({ path: resolve(screenshots, '状态与更新', '08-更新内容弹窗.png') })
+      .catch(() => {});
+    await notes.getByRole('button', { name: '关闭', exact: true }).last().click();
+    await expect(notes).toHaveCount(0);
   } finally {
     await application.close();
   }

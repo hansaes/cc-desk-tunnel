@@ -15,9 +15,13 @@ import type { ProxyClient } from './client.ts';
 import Help from './Help.tsx';
 import type { ConnectionForm } from './LoginPage.tsx';
 import { connectionWaits, setPrefs, usePrefs, waitRange } from './prefs.ts';
+import { viewModes } from './transcriptView.ts';
 import type { ConnectionWaits, NotifyKind } from './prefs.ts';
+import { inSummary, sampleStats, statFields, summaryText } from './turnStats.ts';
 import { GithubMark, openProject, project } from './project.tsx';
 import SettingsPanel from './SettingsPanel.tsx';
+import { useShared } from './shared.ts';
+import type { ListedConnection } from './shared.ts';
 import ShortcutSettings from './ShortcutSettings.tsx';
 import { IconButton, Switch } from './ui.tsx';
 import type { MenuItem } from './ui.tsx';
@@ -45,7 +49,8 @@ const sections: { id: Section; name: string; group: string; icon: typeof Bell; w
     name: '常规',
     group: '客户端',
     icon: SlidersHorizontal,
-    words: '托盘 后台 记住凭据 自动登录 启动 普通会话 文件夹 连接 超时 等待 SSH',
+    words:
+      '额度 输入框 托盘 后台 记住凭据 自动登录 启动 普通会话 文件夹 连接 超时 等待 SSH 回复小结 用量 首字 速度 缓存 多开 多个连接 窗口 服务端',
   },
   {
     id: 'notifications',
@@ -67,7 +72,7 @@ const sections: { id: Section; name: string; group: string; icon: typeof Bell; w
     name: '关于与更新',
     group: '其他',
     icon: Info,
-    words: '版本 升级 检查更新 项目主页 日志 排查 断开',
+    words: '版本 升级 检查更新 项目主页 日志 排查 断开 开发者工具 控制台',
   },
 ];
 const kinds: { key: NotifyKind; title: string; detail: string }[] = [
@@ -104,6 +109,95 @@ const waits: { step: keyof ConnectionWaits; title: string; detail: string }[] = 
     detail: '从连上服务端到隧道接通的总时间；至少比上一项多 35 秒',
   },
 ];
+// How much of the work behind a reply is shown is a choice of this computer's window too.
+function TranscriptViewSettings() {
+  const { view } = usePrefs();
+  const set = (values: Partial<typeof view>) =>
+    setPrefs((prefs) => ({ ...prefs, view: { ...prefs.view, ...values } }));
+  const current = viewModes.find((entry) => entry.mode === view.mode) ?? viewModes[0];
+  return (
+    <>
+      <h2 className="page-heading">工作步骤展示</h2>
+      <div className="card">
+        <div className="setting-row stat-picks">
+          <span>
+            <strong>展示多少</strong>
+            <small>{current.detail}</small>
+          </span>
+          <div className="stat-chips" role="radiogroup" aria-label="工作步骤展示">
+            {viewModes.map((entry) => (
+              <button
+                type="button"
+                key={entry.mode}
+                role="radio"
+                className="stat-chip"
+                aria-checked={entry.mode === view.mode}
+                onClick={() => set({ mode: entry.mode })}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// The line under each reply is a choice of this computer's window, so it works outside the desktop app too.
+function ReplyStats() {
+  const { stats } = usePrefs();
+  const set = (values: Partial<typeof stats>) =>
+    setPrefs((prefs) => ({ ...prefs, stats: { ...prefs.stats, ...values } }));
+  return (
+    <>
+      <h2 className="page-heading">回复小结</h2>
+      <div className="card">
+        <Row title="显示回复小结" detail="每轮回复末尾一个小按钮，点开看全部明细">
+          <Switch
+            label="显示回复小结"
+            checked={stats.enabled}
+            onChange={(enabled) => set({ enabled })}
+          />
+        </Row>
+        <div className="setting-row stat-picks">
+          <span>
+            <strong>小结里显示</strong>
+            <small>{summaryText(sampleStats, stats.summary) || '都不选时只显示“用量明细”'}</small>
+          </span>
+          <div className="stat-chips" role="group" aria-label="小结里显示">
+            {statFields.map((field) => {
+              const on = inSummary(field, stats.summary);
+              return (
+                <button
+                  type="button"
+                  key={field.key}
+                  className="stat-chip"
+                  aria-pressed={on}
+                  disabled={!stats.enabled}
+                  onClick={() => set({ summary: { ...stats.summary, [field.key]: !on } })}
+                >
+                  {field.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <Row title="恢复默认" detail="明细里的数据不受这里的选择影响">
+          <button
+            type="button"
+            className="button"
+            disabled={Object.keys(stats.summary).length === 0}
+            onClick={() => set({ summary: {} })}
+          >
+            恢复默认
+          </button>
+        </Row>
+      </div>
+    </>
+  );
+}
+
 // A number of seconds, taken when the field is left or Enter is pressed; anything out of range is put back.
 function Seconds({
   label,
@@ -142,6 +236,144 @@ function Seconds({
   );
 }
 
+// The computer's connections, each a window of its own to a service of its own: see electron/connections.cjs.
+function Connections() {
+  const [list, setList] = useState<ListedConnection[]>([]);
+  const [name, setName] = useState('');
+  const [editing, setEditing] = useState<{ id: string; name: string } | null>(null);
+  const [error, setError] = useState('');
+  const names = useShared('connections');
+  // Whether a window is open is its process's to tell, so it is asked again while the page is shown.
+  useEffect(() => {
+    const read = () => void window.desktop!.connections().then(setList);
+    read();
+    const timer = setInterval(read, 2000);
+    return () => clearInterval(timer);
+  }, [names]);
+  const act = (work: Promise<ListedConnection[] | void>) =>
+    work.then(
+      (next) => {
+        setError('');
+        if (next) setList(next);
+        return true;
+      },
+      (failure) => {
+        setError(
+          String(failure?.message ?? failure).replace(/^.*?'connections:\w+': (Error: )?/, ''),
+        );
+        return false;
+      },
+    );
+  return (
+    <>
+      <h2 className="page-heading">多个连接</h2>
+      <div className="card">
+        {list.map((entry) => (
+          <Row
+            key={entry.id}
+            title={entry.name}
+            detail={entry.current ? '当前窗口' : entry.open ? '已打开' : '未打开'}
+          >
+            {editing?.id === entry.id ? (
+              <form
+                className="setting-actions"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void act(window.desktop!.renameConnection(entry.id, editing.name)).then(
+                    (done) => done && setEditing(null),
+                  );
+                }}
+              >
+                <input
+                  className="setting-name"
+                  aria-label="连接的名称"
+                  maxLength={24}
+                  autoFocus
+                  value={editing.name}
+                  onChange={(event) => setEditing({ id: entry.id, name: event.target.value })}
+                />
+                <button type="submit" className="button" disabled={!editing.name.trim()}>
+                  保存
+                </button>
+                <button type="button" className="button" onClick={() => setEditing(null)}>
+                  取消
+                </button>
+              </form>
+            ) : (
+              <span className="setting-actions">
+                {!entry.current && (
+                  <button
+                    type="button"
+                    className="button"
+                    aria-label={`打开 ${entry.name}`}
+                    onClick={() => void act(window.desktop!.openConnection(entry.id))}
+                  >
+                    {entry.open ? '切换到' : '打开'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="button"
+                  aria-label={`改名 ${entry.name}`}
+                  onClick={() => setEditing({ id: entry.id, name: entry.name })}
+                >
+                  改名
+                </button>
+                {entry.id && !entry.current && (
+                  <button
+                    type="button"
+                    className="button danger"
+                    aria-label={`删除 ${entry.name}`}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `删除连接“${entry.name}”？它在这台电脑上保存的服务地址、凭据、草稿和定时任务会一并删除；服务端上的会话不受影响。`,
+                        )
+                      )
+                        void act(window.desktop!.removeConnection(entry.id));
+                    }}
+                  >
+                    删除
+                  </button>
+                )}
+              </span>
+            )}
+          </Row>
+        ))}
+        <Row
+          title="新建连接"
+          detail="再开一个窗口去连另一台服务端。每个连接各有自己的服务地址、凭据、草稿和定时任务；项目列表、通知、快捷键等本机设置是共用的"
+        >
+          <form
+            className="setting-actions"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void act(window.desktop!.createConnection(name)).then((done) => done && setName(''));
+            }}
+          >
+            <input
+              className="setting-name"
+              aria-label="新连接的名称"
+              placeholder="例如：工作"
+              maxLength={24}
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+            <button type="submit" className="button" disabled={!name.trim()}>
+              新建并打开
+            </button>
+          </form>
+        </Row>
+      </div>
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+    </>
+  );
+}
+
 function General({
   form,
   changeForm,
@@ -154,7 +386,7 @@ function General({
   chooseWorkspace: (reset: boolean) => void;
 }) {
   const [closeToTray, setCloseToTray] = useState<boolean | null>(null);
-  const { connection, bypassPermissions } = usePrefs();
+  const { connection, bypassPermissions, quota } = usePrefs();
   useEffect(() => {
     void window.desktop?.windowSettings().then((values) => setCloseToTray(values.closeToTray));
   }, []);
@@ -162,7 +394,7 @@ function General({
     <section className="page" aria-label="常规">
       <div className="page-body">
         <h1 className="page-title">常规</h1>
-        {!window.desktop && <p className="muted">这些设置只在桌面客户端里有。</p>}
+        {!window.desktop && <p className="muted">窗口、会话和连接的设置只在桌面客户端里有。</p>}
         {window.desktop && (
           <>
             <h2 className="page-heading">窗口</h2>
@@ -199,6 +431,19 @@ function General({
                 </span>
               </Row>
             </div>
+            <h2 className="page-heading">输入框</h2>
+            <div className="card">
+              <Row
+                title="在输入框旁显示额度"
+                detail="5 小时和每周额度的已用比例，取自最近一次读数；点它打开“账号与额度”"
+              >
+                <Switch
+                  label="在输入框旁显示额度"
+                  checked={quota}
+                  onChange={(value) => setPrefs((prefs) => ({ ...prefs, quota: value }))}
+                />
+              </Row>
+            </div>
             <h2 className="page-heading">连接</h2>
             <div className="card">
               <Row title="记住凭据" detail="服务凭据经当前系统账户加密后保存在本机">
@@ -220,6 +465,7 @@ function General({
                 />
               </Row>
             </div>
+            <Connections />
             <h2 className="page-heading">连接等待时间</h2>
             <div className="card">
               {waits.map(({ step, title, detail }) => (
@@ -266,6 +512,8 @@ function General({
             />
           </Row>
         </div>
+        <TranscriptViewSettings />
+        <ReplyStats />
       </div>
     </section>
   );
@@ -339,11 +587,13 @@ function About({
   service,
   adapterName,
   updates,
+  showNotes,
 }: {
   version: string;
   service: string | null;
   adapterName: string;
   updates: MenuItem[];
+  showNotes: (version: string) => void;
 }) {
   return (
     <section className="page" aria-label="关于与更新">
@@ -351,7 +601,14 @@ function About({
         <h1 className="page-title">关于与更新</h1>
         <div className="card">
           <Row title="客户端版本">
-            <span className="setting-value">{version || '浏览器开发入口'}</span>
+            <span className="setting-actions">
+              <span className="setting-value">{version || '浏览器开发入口'}</span>
+              {version && (
+                <button type="button" className="button" onClick={() => showNotes(version)}>
+                  这一版的更新内容
+                </button>
+              )}
+            </span>
           </Row>
           <Row title="服务端版本">
             <span className="setting-value">{service ?? '未知'}</span>
@@ -399,6 +656,18 @@ function About({
                   打开日志文件夹
                 </button>
               </Row>
+              <Row
+                title="开发者工具"
+                detail="查看界面的控制台报错、检查元素或录制性能记录，反馈界面问题时用得上。在单独的窗口里打开；其中能看到当前页面的全部内容，包括对话，不要按他人的要求在里面粘贴代码"
+              >
+                <button
+                  type="button"
+                  className="button"
+                  onClick={() => void window.desktop!.openDevTools()}
+                >
+                  打开开发者工具
+                </button>
+              </Row>
             </div>
           </>
         )}
@@ -429,6 +698,7 @@ export default function SettingsPage({
   service,
   adapterName,
   updates,
+  showNotes,
   back,
 }: {
   // Given before a connection exists: only this computer's own settings are shown, and this leaves them.
@@ -447,6 +717,7 @@ export default function SettingsPage({
   service: string | null;
   adapterName: string;
   updates: MenuItem[];
+  showNotes: (version: string) => void;
 }) {
   const [search, setSearch] = useState('');
   const term = search.trim().toLowerCase();
@@ -523,7 +794,13 @@ export default function SettingsPage({
         ) : section === 'help' ? (
           <Help />
         ) : (
-          <About version={version} service={service} adapterName={adapterName} updates={updates} />
+          <About
+            version={version}
+            service={service}
+            adapterName={adapterName}
+            updates={updates}
+            showNotes={showNotes}
+          />
         )}
       </main>
     </>

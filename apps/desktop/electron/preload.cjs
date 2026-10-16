@@ -2,14 +2,30 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('desktop', {
   dev: process.argv.includes('--cc-desk-tunnel-dev'),
   platform: process.platform,
+  // Read once, before the page draws: see `boot` in main.cjs.
+  boot: ipcRenderer.sendSync('boot'),
+  saveShared: (key, value) => ipcRenderer.invoke('shared:save', key, value),
+  onSharedChanged: (callback) => {
+    const listener = (_event, key, value) => callback(key, value);
+    ipcRenderer.on('shared:changed', listener);
+    return () => ipcRenderer.removeListener('shared:changed', listener);
+  },
+  setBusy: (runs) => ipcRenderer.invoke('busy:set', runs),
+  connections: () => ipcRenderer.invoke('connections:list'),
+  createConnection: (name) => ipcRenderer.invoke('connections:create', name),
+  openConnection: (id) => ipcRenderer.invoke('connections:open', id),
+  renameConnection: (id, name) => ipcRenderer.invoke('connections:rename', id, name),
+  removeConnection: (id) => ipcRenderer.invoke('connections:remove', id),
   chooseProject: () => ipcRenderer.invoke('project:choose'),
   asOnDisk: (path) => ipcRenderer.invoke('project:spelling', path),
+  foldersExist: (folders) => ipcRenderer.invoke('folders:exist', folders),
   chooseFiles: () => ipcRenderer.invoke('files:choose'),
   pathForFile: (file) => webUtils.getPathForFile(file),
   saveFile: (name, text) => ipcRenderer.invoke('file:save', name, text),
   saveImage: (type, bytes) => ipcRenderer.invoke('image:save', type, bytes),
   openFolder: (directory) => ipcRenderer.invoke('folder:open', directory),
   openLogs: () => ipcRenderer.invoke('log:open'),
+  openDevTools: () => ipcRenderer.invoke('devtools:open'),
   gitBranch: (directory) => ipcRenderer.invoke('git:branch', directory),
   copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
@@ -38,14 +54,21 @@ contextBridge.exposeInMainWorld('desktop', {
   },
   zoom: (direction) =>
     webFrame.setZoomLevel(direction ? webFrame.getZoomLevel() + Math.sign(direction) * 0.5 : 0),
-  quit: () => ipcRenderer.invoke('app:quit'),
+  quit: (all) => ipcRenderer.invoke('app:quit', all),
   version: () => ipcRenderer.invoke('app:version'),
+  releaseNotes: (version) => ipcRenderer.invoke('release:notes', version),
   device: () => ipcRenderer.invoke('device:get'),
   installUpdate: (version) => ipcRenderer.invoke('update:install', version),
   onUpdateProgress: (callback) => {
     const listener = (_event, progress) => callback(progress);
     ipcRenderer.on('update:progress', listener);
     return () => ipcRenderer.removeListener('update:progress', listener);
+  },
+  upgradeService: (config) => ipcRenderer.invoke('service:upgrade', config),
+  onServiceUpgrade: (callback) => {
+    const listener = (_event, update) => callback(update);
+    ipcRenderer.on('service:upgrade-progress', listener);
+    return () => ipcRenderer.removeListener('service:upgrade-progress', listener);
   },
   connectProxy: (config) => ipcRenderer.invoke('proxy:connect', config),
   disconnectProxy: () => ipcRenderer.invoke('proxy:disconnect'),

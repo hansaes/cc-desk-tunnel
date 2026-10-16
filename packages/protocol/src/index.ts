@@ -1,7 +1,22 @@
 import { z } from 'zod';
 
-export const PROTOCOL_VERSION = 16;
+export const PROTOCOL_VERSION = 18;
+// The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
+// the service's number to have it upgrade (see the README). A new number adds its line here.
+export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
+  '0.2.4': 10,
+  '0.2.6': 11,
+  '0.2.9': 12,
+  '0.2.10': 13,
+  '0.2.11': 14,
+  '0.2.12': 15,
+  '0.3.0': 16,
+  '0.3.2': 17,
+  '0.3.3': 18,
+};
 export const MAX_FRAME_BYTES = 256 * 1024;
+// The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
+export const INSTRUCTIONS_LIMIT = 64_000;
 const id = z.uuid();
 const timestamp = z.iso.datetime();
 // `bypassPermissions` asks about nothing at all; the client offers it only once the user allowed that.
@@ -243,6 +258,17 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     models: z.array(modelInfoSchema),
     account: nativeAccountSchema,
     commands: z.array(z.string()),
+    // What each command does and takes, in Claude Code's words; those bound to its own terminal are left out.
+    commandDetails: z
+      .array(
+        z.object({
+          name: z.string(),
+          description: z.string(),
+          argumentHint: z.string(),
+          aliases: z.array(z.string()).optional(),
+        }),
+      )
+      .optional(),
   }),
   z.object({
     type: z.literal('native.metrics'),
@@ -257,6 +283,23 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     trigger: z.string(),
     previousTokens: z.number().nonnegative().nullable(),
   }),
+  // What one turn cost, summed from the model requests the CLI reported for it; the figures are the call log's.
+  z.object({
+    type: z.literal('turn.stats'),
+    // The user message the turn answered; a turn that a background task started has none.
+    messageId: id.optional(),
+    requests: z.number().int().nonnegative(),
+    inputTokens: z.number().nonnegative(),
+    outputTokens: z.number().nonnegative(),
+    cacheReadTokens: z.number().nonnegative(),
+    cacheCreationTokens: z.number().nonnegative(),
+    modelMs: z.number().nonnegative(),
+    // Averages over the requests that report a first-token time; null when none does.
+    ttftMs: z.number().nonnegative().nullable(),
+    outputPerSecond: z.number().nonnegative().nullable(),
+    // Fewer requests were reported than the turn made when this was written.
+    partial: z.boolean(),
+  }),
   z.object({ type: z.literal('tool.requested'), ...toolSchema.shape }),
   z.object({ type: z.literal('tool.input'), toolId: z.string().min(1), input: z.string() }),
   z.object({ type: z.literal('tool.input.delta'), toolId: z.string().min(1), text: z.string() }),
@@ -264,6 +307,15 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     type: z.literal('tool.progress'),
     toolId: z.string().min(1),
     elapsedSeconds: z.number().nonnegative(),
+  }),
+  // What a background task says of itself while it runs. It is worth something only until the task ends, so
+  // it reaches the windows as a fragment and is never recorded.
+  z.object({
+    type: z.literal('native.progress'),
+    taskId: z.string().min(1),
+    tool: z.string().max(100).optional(),
+    toolUses: z.number().int().nonnegative().optional(),
+    summary: z.string().max(300).optional(),
   }),
   z.object({ type: z.literal('approval.requested'), approvalId: id, toolId: z.string().min(1) }),
   z.object({ type: z.literal('approval.resolved'), approvalId: id, allowed: z.boolean() }),
@@ -308,6 +360,7 @@ export function continues(open: Fragment, next: Fragment) {
   if (open.toolId !== (next as typeof open).toolId) return false;
   return open.type !== 'tool.output' || open.stream === (next as typeof open).stream;
 }
+export type TurnStats = Payload<'turn.stats'>;
 export const eventSchema = z.object({
   sessionId: id,
   runId: id,
@@ -334,8 +387,8 @@ export const sessionSchema = z.object({
   title: z.string().min(1).max(120),
   autoTitle: z.boolean().default(false),
   projectPath: z.string().min(1).max(2048),
-  // The computer the project directory is on, and so the only one to send the session messages. A session
-  // from before 0.2.11 has none until a computer sends it one.
+  // The computer the project directory is on, and so where the session's runs and commands are, whichever of
+  // the user's computers sends its messages. A session from before 0.2.11 has none until a computer sends it one.
   device: deviceSchema.optional(),
   permissionMode: permissionModeSchema.default('auto'),
   model: z.string().trim().min(1).max(200).nullable().default(null),
@@ -430,6 +483,16 @@ export const commandSchema = z.discriminatedUnion('type', [
       type: z.literal('settings.update'),
       ...request,
       values: nativeSettingsSchema.partial().strict(),
+    })
+    .strict(),
+  z.object({ type: z.literal('instructions.get'), ...request }).strict(),
+  z
+    .object({
+      type: z.literal('instructions.update'),
+      ...request,
+      text: z.string().max(INSTRUCTIONS_LIMIT),
+      // The version the text was edited from; the file is written only if it is still that one.
+      version: z.string().max(100),
     })
     .strict(),
   z.object({ type: z.literal('usage.summary'), ...request }).strict(),
@@ -640,6 +703,12 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('account.state'), ...accountStateSchema.shape }),
   z.object({ type: z.literal('settings.state'), requestId: id, values: nativeSettingsSchema }),
+  z.object({
+    type: z.literal('instructions.state'),
+    requestId: id,
+    text: z.string(),
+    version: z.string(),
+  }),
   z.object({ type: z.literal('usage.summary'), requestId: id, ...usageSummarySchema.shape }),
   z.object({ type: z.literal('usage.page'), requestId: id, ...usagePageSchema.shape }),
   z.object({ type: z.literal('terminal.opened'), sessionId: id, terminalId: id }),
@@ -674,6 +743,12 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     client: installerSchema.optional(),
   }),
   z.object({ type: z.literal('service.update'), ...serviceUpdateSchema.shape }),
+  // The user's computers connected now, each with whether commands reach it yet: sent on signing in and
+  // whenever it changes. A computer not listed is away, and its sessions can only be read.
+  z.object({
+    type: z.literal('devices'),
+    devices: z.array(deviceSchema.extend({ ready: z.boolean() })),
+  }),
   // The execution channel runs over connections the device opens to this same address. `secret` signs them
   // in; it belongs to this connection alone and ends with it.
   z.object({ type: z.literal('tunnel.offer'), connectionId: id, secret: tunnelSecret }),

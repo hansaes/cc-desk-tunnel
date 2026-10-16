@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import {
+  PROTOCOL_HISTORY,
   PROTOCOL_VERSION,
   authSchema,
   commandSchema,
@@ -25,6 +26,9 @@ test('protocol validates UTF-8 text, IDs and bounded input', () => {
   assert.equal(commandSchema.safeParse({ ...command, token: 'unexpected' }).success, false);
 });
 
+test('the protocol history ends with the current version', () => {
+  assert.equal(Object.values(PROTOCOL_HISTORY).at(-1), PROTOCOL_VERSION);
+});
 test('authentication version and event ordering are explicit', () => {
   const auth = {
     type: 'auth',
@@ -113,4 +117,30 @@ test('a run waiting only for background tasks, its task list and the request to 
   };
   assert.ok(commandSchema.safeParse(stop).success);
   assert.equal(commandSchema.safeParse({ ...stop, taskId: '' }).success, false);
+});
+
+test('a turn report names the message it answered, or none for a turn a background task started', () => {
+  const stats = {
+    type: 'turn.stats',
+    requests: 3,
+    inputTokens: 10,
+    outputTokens: 200,
+    cacheReadTokens: 1000,
+    cacheCreationTokens: 50,
+    modelMs: 5500,
+    ttftMs: null,
+    outputPerSecond: null,
+    partial: false,
+  };
+  const event = (payload: object) => ({
+    sessionId: randomUUID(),
+    runId: randomUUID(),
+    sequence: 1,
+    createdAt: new Date().toISOString(),
+    payload,
+  });
+  assert.equal(eventSchema.safeParse(event({ ...stats, messageId: randomUUID() })).success, true);
+  assert.equal(eventSchema.safeParse(event(stats)).success, true);
+  assert.equal(eventSchema.safeParse(event({ ...stats, requests: -1 })).success, false);
+  assert.equal(eventSchema.safeParse(event({ ...stats, partial: undefined })).success, false);
 });

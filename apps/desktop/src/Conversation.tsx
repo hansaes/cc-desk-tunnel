@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from 'react';
 import {
   ArrowUpToLine,
@@ -29,12 +30,17 @@ import {
 import type { Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
-import type { HistoryState } from './client.ts';
+import type { HistoryState, TaskProgress } from './client.ts';
+import { RunStatus, TaskLine } from './RunStatus.tsx';
+import type { Clock } from './RunStatus.tsx';
 import QuestionCard, { questionsOf } from './QuestionCard.tsx';
 import { conversation } from './transcript.ts';
+import { usePrefs } from './prefs.ts';
+import { firstLine } from './transcriptView.ts';
 import type { TranscriptItem, Turn, Work } from './transcript.ts';
 import { CopyButton, copyText } from './copy.tsx';
 import { messageTime } from './messageTime.ts';
+import TurnStats from './TurnStats.tsx';
 import ConversationFind, { SearchExpanded } from './ConversationFind.tsx';
 import { IconButton, Menu } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
@@ -53,6 +59,9 @@ type Live = {
   now: number;
   busy: boolean;
   canApprove: (tool: Tool) => boolean;
+  // This window has answered the approval and waits for the service to take it: a second press would be
+  // a second answer.
+  answered: (tool: Tool) => boolean;
   reply: (tool: Tool, allowed: boolean, answers?: Record<string, string>) => void;
   // Absent while a fork cannot be made.
   edit?: (item: Text) => void;
@@ -108,7 +117,7 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
     return (
       <QuestionCard
         questions={questions}
-        busy={live.busy}
+        busy={live.busy || live.answered(tool)}
         answer={(answers) => live.reply(tool, true, answers)}
         skip={() => live.reply(tool, false)}
       />
@@ -166,7 +175,7 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
               <button
                 type="button"
                 className="button secondary"
-                disabled={live.busy}
+                disabled={live.busy || live.answered(tool)}
                 onClick={() => live.reply(tool, false)}
               >
                 <X />
@@ -175,7 +184,7 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
               <button
                 type="button"
                 className="button primary"
-                disabled={live.busy}
+                disabled={live.busy || live.answered(tool)}
                 onClick={() => live.reply(tool, true)}
               >
                 <Check />
@@ -186,6 +195,47 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
         </div>
       )}
     </Fold>
+  );
+}
+
+// The calls and thoughts of a run, one under another.
+function WorkItems({
+  work,
+  active,
+  live,
+  preview,
+}: {
+  work: Work;
+  active: boolean;
+  live: Live;
+  preview?: boolean;
+}) {
+  return (
+    <>
+      {work.items.map((item) =>
+        item.kind === 'tool' ? (
+          <ToolRow key={item.id} tool={item} active={active} live={live} />
+        ) : (
+          <Fold
+            key={item.id}
+            className="tool thinking-block"
+            summary={
+              <span className="tool-heading">
+                <Brain />
+                <span className="tool-verb">思考</span>
+                {preview && <span className="thinking-preview">{firstLine(item.text)}</span>}
+              </span>
+            }
+          >
+            {() => (
+              <div className="message-content tool-detail" data-search-content>
+                <Rich text={item.text} />
+              </div>
+            )}
+          </Fold>
+        ),
+      )}
+    </>
   );
 }
 
@@ -213,88 +263,129 @@ function WorkGroup({
         </span>
       }
     >
-      {() =>
-        work.items.map((item) =>
-          item.kind === 'tool' ? (
-            <ToolRow key={item.id} tool={item} active={active} live={live} />
-          ) : (
-            <Fold
-              key={item.id}
-              className="tool thinking-block"
-              summary={
-                <span className="tool-heading">
-                  <Brain />
-                  <span className="tool-verb">思考</span>
-                </span>
-              }
-            >
-              {() => (
-                <div className="message-content tool-detail" data-search-content>
-                  <Rich text={item.text} />
-                </div>
-              )}
-            </Fold>
-          ),
-        )
-      }
+      {() => <WorkItems work={work} active={active} live={live} />}
     </Fold>
   );
 }
 
+// No message has a heading; what belongs to it is in a line under it, shown while the pointer is over the message. Under
+// a question: how it was delivered, its time, editing and copy, at the right like the question. Under the reply that
+// closes a turn: copy, the turn's figures and the time, always shown on the latest. Replies said along the way have
+// nothing under them. A delivery that did not plainly arrive stays in sight. Replies of the simulated service keep the
+// heading, which says they are not real.
 function Message({
   item,
   native,
   edit,
+  footer,
+  closing = false,
+  latest = false,
+  joined = false,
 }: {
   item: Text;
   native: boolean;
   edit?: (item: Text) => void;
+  footer?: ReactNode;
+  closing?: boolean;
+  latest?: boolean;
+  // A question put in while the run went on.
+  joined?: boolean;
 }) {
-  const time = messageTime(item.at);
+  const time = messageTime(item.kind === 'assistant' ? (item.doneAt ?? item.at) : item.at);
+  const user = item.kind === 'user';
+  const stamp = time && (
+    <time className="message-time" dateTime={item.at} title={time.full}>
+      {time.short}
+    </time>
+  );
   return (
-    <article className={`message ${item.kind}`}>
-      <div className="message-label">
-        {edit && (
-          <button
-            type="button"
-            className="message-action"
-            aria-label="编辑重发"
-            title="编辑重发：从这条消息之前分叉出新会话，原会话保留"
-            onClick={() => edit(item)}
-          >
-            <Pencil />
-          </button>
-        )}
-        {item.kind === 'user' ? '你' : native ? 'Claude Code' : 'CC Desk Tunnel'}
-        {item.kind === 'assistant' && !native && <span>模拟</span>}
-        {item.kind === 'user' && item.delivery && <span>{item.delivery}</span>}
-        {time && (
-          <time className="message-time" dateTime={item.at} title={time.full}>
-            {time.short}
-          </time>
-        )}
-        <CopyButton text={item.text} />
-      </div>
+    <article className={`message ${item.kind}${latest ? ' latest' : ''}${joined ? ' joined' : ''}`}>
+      {!user && !native && (
+        <div className="message-label">
+          CC Desk Tunnel
+          <span>模拟</span>
+          {stamp}
+          <CopyButton text={item.text} />
+        </div>
+      )}
       <div className="message-content" data-search-content data-copy-text={item.text}>
-        {item.kind === 'user' ? <p>{item.text}</p> : <Rich text={item.text} />}
+        {user ? <p>{item.text}</p> : <Rich text={item.text} />}
       </div>
+      {user && (
+        <div className="message-footer">
+          {item.delivery && (
+            <span
+              className={`message-delivery${item.delivery === '原生已接收' ? '' : ' unsettled'}`}
+            >
+              {item.delivery}
+            </span>
+          )}
+          {stamp}
+          {edit && (
+            <button
+              type="button"
+              className="message-action"
+              aria-label="编辑重发"
+              title="编辑重发：从这条消息之前分叉出新会话，原会话保留"
+              onClick={() => edit(item)}
+            >
+              <Pencil />
+            </button>
+          )}
+          <CopyButton text={item.text} />
+        </div>
+      )}
+      {!user && native && closing && (
+        <div className="message-footer">
+          <CopyButton text={item.text} />
+          {footer}
+          {stamp}
+        </div>
+      )}
     </article>
   );
 }
 
-function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: Live }) {
+// A question put in while the run goes on closes the turn before it, but the run has not finished: that turn and the
+// ones joined to it stay as they were until it has.
+function heldOpen(turns: Turn[], index: number) {
+  let last = index;
+  while (turns[last + 1]?.joined) last++;
+  return last > index && !turns[last].endedAt;
+}
+
+function TurnView({
+  turn,
+  native,
+  live,
+  latest,
+  held,
+}: {
+  turn: Turn;
+  native: boolean;
+  live: Live;
+  latest: boolean;
+  held: boolean;
+}) {
   const active = !turn.endedAt;
+  const expanded = usePrefs().view.mode === 'expanded';
   const notes = turn.steps.filter((step) => step.kind === 'assistant').length;
   const steps = () =>
     turn.steps.map((step, index) =>
       step.kind === 'work' ? (
-        <WorkGroup
-          key={step.id}
-          work={step}
-          active={active}
-          latest={index === turn.steps.length - 1}
-          live={live}
-        />
+        expanded ? (
+          <div key={step.id} className="work-flat">
+            <WorkItems work={step} active={active} live={live} preview />
+          </div>
+        ) : (
+          <WorkGroup
+            key={step.id}
+            work={step}
+            active={active}
+            latest={index === turn.steps.length - 1}
+            live={live}
+          />
+        )
       ) : (
         <Message key={step.id} item={step} native={native} />
       ),
@@ -311,16 +402,19 @@ function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: L
             item={turn.question}
             native={native}
             edit={turn.joined ? undefined : live.edit}
+            joined={turn.joined}
           />
         )
       )}
-      {active
+      {active || held || expanded
         ? steps()
         : turn.steps.length > 0 && (
             <Fold
               className="turn-process"
               summary={
-                <span>
+                <span className={turn.outcome}>
+                  {turn.outcome === 'cancelled' && '已停止 · '}
+                  {turn.outcome === 'failed' && '处理失败 · '}
                   用时 {duration(turn.startedAt, turn.endedAt!)}
                   {turn.tools > 0 && ` · ${turn.tools} 步`}
                   {notes > 0 && ` · ${notes} 条说明`}
@@ -330,7 +424,24 @@ function TurnView({ turn, native, live }: { turn: Turn; native: boolean; live: L
               {steps}
             </Fold>
           )}
-      {turn.answer && <Message item={turn.answer} native={native} />}
+      {turn.answer ? (
+        <Message
+          item={turn.answer}
+          native={native}
+          closing
+          latest={latest}
+          footer={turn.stats && <TurnStats stats={turn.stats} />}
+        />
+      ) : (
+        turn.stats &&
+        turn.endedAt && (
+          <div className={`message assistant${latest ? ' latest' : ''}`}>
+            <div className="message-footer">
+              <TurnStats stats={turn.stats} />
+            </div>
+          </div>
+        )
+      )}
       {turn.notices.map((item) => (
         <div
           key={item.id}
@@ -352,6 +463,8 @@ export default function Conversation({
   connected,
   native,
   ownsRun,
+  clock,
+  progress,
   busy,
   newSession,
   loadEarlier,
@@ -379,10 +492,28 @@ export default function Conversation({
     approvalId: string,
     allowed: boolean,
     answers?: Record<string, string>,
-  ) => void;
+    // Whether the answer reached the service.
+  ) => Promise<boolean>;
   edit?: (messageId: string, text: string) => void;
+  clock: Clock;
+  // What the session's background tasks last said of themselves, by task.
+  progress: Record<string, TaskProgress> | undefined;
 }) {
   const turns = useMemo(() => conversation(events), [events]);
+  const toolAtWork = !!turns
+    .at(-1)
+    ?.steps.flatMap((step) => (step.kind === 'work' ? step.items : []))
+    .some((item) => item.kind === 'tool' && item.state === 'running');
+  // A task has been waited for since the run first listed it.
+  const listedAt = (taskId: string) =>
+    Date.parse(
+      events.find(
+        (event) =>
+          event.runId === session?.activeRun?.id &&
+          event.payload.type === 'native.tasks' &&
+          event.payload.tasks.some((task) => task.id === taskId),
+      )?.createdAt ?? '',
+    ) || clock.now();
   const background = session?.activeRun?.waiting === 'background';
   const tasks = useMemo(() => {
     const last = events.findLast(
@@ -429,17 +560,35 @@ export default function Conversation({
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [running]);
+  // Approvals answered from here, until the service has them; one it refused can be answered again. The
+  // ref stops a second press before the page has drawn the first; the state greys the buttons out.
+  const answering = useRef(new Set<string>());
+  const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   const live: Live = {
     now,
     busy,
+    answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
     canApprove: (tool) =>
       connected &&
       ownsRun &&
       session?.activeRun?.id === tool.runId &&
       !tool.resolved &&
       !!tool.approvalId,
-    reply: (tool, allowed, answers) =>
-      replyApproval(tool.runId, tool.approvalId!, allowed, answers),
+    reply: (tool, allowed, answers) => {
+      const id = tool.approvalId!;
+      if (answering.current.has(id)) return;
+      answering.current.add(id);
+      setAnswered((value) => new Set(value).add(id));
+      void replyApproval(tool.runId, id, allowed, answers).then((sent) => {
+        if (sent) return;
+        answering.current.delete(id);
+        setAnswered((value) => {
+          const rest = new Set(value);
+          rest.delete(id);
+          return rest;
+        });
+      });
+    },
     edit: edit && !running ? (item) => edit(item.id, item.text) : undefined,
   };
   const scroll = useRef<HTMLDivElement>(null);
@@ -448,6 +597,9 @@ export default function Conversation({
   // Earlier history is inserted above; the anchor keeps the lines being read where they were.
   const prependAnchor = useRef<{ sessionId: string; height: number; top: number } | null>(null);
   const lastTop = useRef(0);
+  // A button is held on the conversation: on its scrollbar, or selecting text past its edge.
+  const held = useRef(false);
+  const toEnd = () => scroll.current?.scrollTo(0, scroll.current.scrollHeight);
   const loadMore = () => {
     if (!session || !connected || !history?.hasEarlier || history.loadingEarlier || history.loading)
       return;
@@ -463,7 +615,7 @@ export default function Conversation({
   useLayoutEffect(() => {
     prependAnchor.current = null;
     follow.current = true;
-    scroll.current?.scrollTo(0, scroll.current.scrollHeight);
+    toEnd();
   }, [session?.id]);
   useLayoutEffect(() => {
     const anchor = prependAnchor.current;
@@ -474,8 +626,20 @@ export default function Conversation({
       return;
     }
     if (anchor) return;
-    if (follow.current && !findOpen) scroll.current?.scrollTo(0, scroll.current.scrollHeight);
+    if (follow.current && !findOpen) toEnd();
   }, [events, history?.loadingEarlier, session?.id]);
+  // Heights keep changing after that scroll with nothing new said: a reply's Markdown drawn late, messages the page
+  // had only estimated until they came into view (`content-visibility`), a resized window. While following, the
+  // view keeps to the end through them.
+  useEffect(() => {
+    if (!scroll.current || !transcriptRoot.current) return;
+    const observer = new ResizeObserver(() => {
+      if (follow.current && !findOpen && !prependAnchor.current) toEnd();
+    });
+    observer.observe(scroll.current);
+    observer.observe(transcriptRoot.current);
+    return () => observer.disconnect();
+  }, [session?.id, findOpen]);
 
   return (
     <SearchExpanded.Provider value={searching}>
@@ -548,12 +712,33 @@ export default function Conversation({
         onScroll={() => {
           if (!scroll.current) return;
           const top = scroll.current.scrollTop;
-          follow.current = scroll.current.scrollHeight - top - scroll.current.clientHeight < 80;
+          // Reaching the end follows again. Only the reader leaves it: settling heights move the view too.
+          if (scroll.current.scrollHeight - top - scroll.current.clientHeight < 80)
+            follow.current = true;
+          else if (held.current && top < lastTop.current) follow.current = false;
           // Reading on upwards past what is loaded brings the page before it; a failed load waits for the button.
           if (top < lastTop.current && top < 240 && !loadError) loadMore();
           lastTop.current = top;
         }}
+        onPointerDown={(event) => {
+          held.current = true;
+          const release = () => {
+            held.current = false;
+            window.removeEventListener('pointerup', release);
+            window.removeEventListener('pointercancel', release);
+          };
+          window.addEventListener('pointerup', release);
+          window.addEventListener('pointercancel', release);
+          // Steps opened or closed are being read where they are.
+          if ((event.target as HTMLElement).closest('summary')) follow.current = false;
+        }}
+        onKeyDown={(event) => {
+          if ((event.target as HTMLElement).closest('input, textarea, [contenteditable="true"]'))
+            return;
+          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) follow.current = false;
+        }}
         onWheel={(event) => {
+          if (event.deltaY < 0) follow.current = false;
           // A loaded page shorter than the window cannot scroll, so the wheel itself asks for more.
           if (event.deltaY < 0 && scroll.current?.scrollTop === 0 && !loadError) loadMore();
         }}
@@ -602,21 +787,41 @@ export default function Conversation({
                 <span className="empty-project">{session.projectPath}</span>
               </div>
             )}
-            {turns.map((turn) => (
-              <TurnView key={turn.id} turn={turn} native={native} live={live} />
+            {turns.map((turn, index) => (
+              <TurnView
+                key={turn.id}
+                turn={turn}
+                native={native}
+                live={live}
+                latest={index === turns.length - 1}
+                held={heldOpen(turns, index)}
+              />
             ))}
             {session.activeRun && background && (
               <div className="background-tasks">
                 <div className="run-indicator" role="status">
-                  <span className="running-dot" />
+                  <span className={`running-dot${connected ? ' breathing' : ''}`} />
                   后台任务{tasks.length ? ` ${tasks.length} 个` : ''} · Claude
                   已答完，任务结束后会接着处理
-                  {!ownsRun && ' · 另一连接'}
+                  {!ownsRun && ' · 所在设备不在线'}
                 </div>
+                {/* The run is still on, so the controls that need it over are greyed out; this says why. */}
+                <p className="background-hint">
+                  任务结束前不能更改模型、思考强度和审批模式，也不能改名、分叉或编辑重发
+                  {ownsRun && '；消息可以照常发送'}。
+                </p>
                 <ul>
                   {tasks.map((task) => (
                     <li key={task.id}>
-                      <span>{task.description || task.kind}</span>
+                      <span>
+                        {task.description || task.kind}
+                        <TaskLine
+                          since={listedAt(task.id)}
+                          progress={progress?.[task.id]}
+                          clock={clock}
+                          connected={connected}
+                        />
+                      </span>
                       <button
                         type="button"
                         className="button"
@@ -640,17 +845,26 @@ export default function Conversation({
                 )}
               </div>
             )}
-            {session.activeRun && !background && (
-              <div className="run-indicator" role="status">
-                <span className="running-dot" />
-                {session.activeRun.status !== 'awaiting_approval'
-                  ? '运行中'
-                  : session.activeRun.waiting === 'question'
-                    ? '等待回答'
-                    : '等待审批'}
-                {!ownsRun && ' · 另一连接'}
-              </div>
-            )}
+            {session.activeRun &&
+              !background &&
+              (session.activeRun.status !== 'awaiting_approval' ? (
+                <RunStatus
+                  tool={toolAtWork}
+                  since={Math.max(
+                    clock.activityAt(session.id),
+                    Date.parse(events.at(-1)?.createdAt ?? '') || 0,
+                  )}
+                  clock={clock}
+                  connected={connected}
+                  suffix={ownsRun ? '' : ' · 所在设备不在线'}
+                />
+              ) : (
+                <div className="run-indicator" role="status">
+                  <span className="running-dot" />
+                  {session.activeRun.waiting === 'question' ? '等待回答' : '等待审批'}
+                  {!ownsRun && ' · 所在设备不在线'}
+                </div>
+              ))}
           </div>
         )}
       </div>

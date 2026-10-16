@@ -4,6 +4,7 @@ import {
   PROTOCOL_VERSION,
   serverMessageSchema,
 } from '@cc-desk-tunnel/protocol';
+import type { EventPayload } from '@cc-desk-tunnel/protocol';
 import type {
   AccountState,
   Command,
@@ -20,7 +21,7 @@ import type {
 type Response = Extract<ServerMessage, { type: 'response' }>;
 type DataMessage = Extract<
   ServerMessage,
-  { type: 'usage.summary' | 'usage.page' | 'settings.state' }
+  { type: 'usage.summary' | 'usage.page' | 'settings.state' | 'instructions.state' }
 >;
 // Commands answered with a data frame, and the frame each one gets.
 type Replies = {
@@ -28,6 +29,8 @@ type Replies = {
   'usage.query': 'usage.page';
   'settings.get': 'settings.state';
   'settings.update': 'settings.state';
+  'instructions.get': 'instructions.state';
+  'instructions.update': 'instructions.state';
 };
 type TerminalMessage = Extract<
   ServerMessage,
@@ -51,6 +54,7 @@ export class RequestInterruptedError extends Error {
       'usage.summary',
       'usage.query',
       'settings.get',
+      'instructions.get',
       'service.update.check',
     ].includes(type);
     super(
@@ -79,8 +83,11 @@ export type HistoryState = {
 export type ClientState = {
   status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   connectionId: string | null;
-  // The computer this client signed in as; a session is worked on from the one it is on.
+  // The computer this client signed in as; a session's commands run on the one it is on.
   device: Device | null;
+  // The user's computers connected to the service now, and whether commands reach each yet. Another
+  // computer's sessions can be worked on from here while it is listed and ready.
+  devices: ConnectedDevice[];
   sessions: Session[];
   events: Record<string, SessionEvent[]>;
   // Output a run is in the middle of, as far as it has arrived. It has no place in the history yet: the
@@ -105,7 +112,12 @@ export type ClientState = {
   capabilities: NativeCapabilities | null;
   metrics: NativeMetrics | null;
   account: AccountState | null;
+  // What each session's background tasks last said of themselves, by task: kept while the window is open
+  // and nowhere else.
+  progress: Record<string, Record<string, TaskProgress>>;
 };
+export type TaskProgress = Extract<EventPayload, { type: 'native.progress' }>;
+export type ConnectedDevice = Extract<ServerMessage, { type: 'devices' }>['devices'][number];
 
 // The renderer's single connection and its state store: components read `state` through subscribe / getSnapshot
 // and send commands with request(). A connection that breaks is made again, for as long as it takes, and what
@@ -115,6 +127,7 @@ export class ProxyClient {
     status: 'disconnected',
     connectionId: null,
     device: null,
+    devices: [],
     sessions: [],
     events: {},
     live: {},
@@ -131,6 +144,7 @@ export class ProxyClient {
     capabilities: null,
     metrics: null,
     account: null,
+    progress: {},
   };
   results = new Map<string, DataMessage>();
   listeners = new Set<() => void>();
@@ -158,6 +172,14 @@ export class ProxyClient {
   streamEvents: (SessionEvent | Extract<ServerMessage, { type: 'session.fragment' }>)[] = [];
   // Event history is kept for the most recently viewed sessions only.
   cacheOrder: string[] = [];
+  // When something last came from each session's run, by the service's clock, for telling a run that goes on
+  // from one that has been quiet for long. Readings of the context and the quota repeat through a long turn
+  // and say nothing of it.
+  private activity = new Map<string, number>();
+  // How far this computer's clock is ahead of the service's, as near as the fastest event yet shows.
+  private ahead = Infinity;
+  serviceNow = () => Date.now() - (Number.isFinite(this.ahead) ? this.ahead : 0);
+  activityAt = (sessionId: string) => this.activity.get(sessionId) ?? 0;
   pending = new Map<
     string,
     {
@@ -207,6 +229,7 @@ export class ProxyClient {
     this.update({
       status: 'connecting',
       device,
+      devices: [],
       error: null,
       release: null,
       service: null,
@@ -339,7 +362,8 @@ export class ProxyClient {
       } else if (
         message.type === 'usage.summary' ||
         message.type === 'usage.page' ||
-        message.type === 'settings.state'
+        message.type === 'settings.state' ||
+        message.type === 'instructions.state'
       ) {
         if (this.pending.has(message.requestId)) this.results.set(message.requestId, message);
       } else if (message.type === 'service.update') {
@@ -355,6 +379,8 @@ export class ProxyClient {
         this.update(
           account.loggedIn ? { account } : { account, capabilities: null, metrics: null },
         );
+      } else if (message.type === 'devices') {
+        this.update({ devices: message.devices });
       } else if (message.type === 'session.updated') {
         this.upsert(message.session);
       } else if (
@@ -411,12 +437,17 @@ export class ProxyClient {
         this.merge(id, message.events, history, message.mode === 'replace');
       } else if (message.type === 'session.event') {
         const payload = message.event.payload;
+        const at = Date.parse(message.event.createdAt);
+        this.ahead = Math.min(this.ahead, Date.now() - at);
+        if (!['native.metrics', 'native.capabilities', 'native.context'].includes(payload.type))
+          this.activity.set(message.event.sessionId, at);
         if (payload.type === 'native.capabilities') this.update({ capabilities: payload });
         if (payload.type === 'native.metrics') this.update({ metrics: payload });
         if (!this.cacheOrder.includes(message.event.sessionId)) return;
         this.streamEvents.push(message.event);
         this.streamTimer ??= setTimeout(() => this.flushStream(), 32);
       } else if (message.type === 'session.fragment') {
+        this.activity.set(message.sessionId, this.serviceNow());
         if (!this.cacheOrder.includes(message.sessionId)) return;
         this.streamEvents.push(message);
         this.streamTimer ??= setTimeout(() => this.flushStream(), 32);
@@ -442,7 +473,7 @@ export class ProxyClient {
         });
         return;
       }
-      this.update({ status: 'reconnecting', connectionId: null });
+      this.update({ status: 'reconnecting', connectionId: null, devices: [] });
       this.retryTimer = setTimeout(
         () => {
           this.retryTimer = undefined;
@@ -497,10 +528,28 @@ export class ProxyClient {
     const grouped = new Map<string, SessionEvent[]>();
     const live = { ...this.state.live };
     let moved = false;
+    let progress = this.state.progress;
     for (const item of this.streamEvents) {
       const open = live[item.sessionId];
+      // A list of background tasks ends what the tasks no longer on it had said.
+      if (!('type' in item) && item.payload.type === 'native.tasks' && progress[item.sessionId]) {
+        const listed = item.payload.tasks.map((task) => task.id);
+        progress = {
+          ...progress,
+          [item.sessionId]: Object.fromEntries(
+            Object.entries(progress[item.sessionId]).filter(([id]) => listed.includes(id)),
+          ),
+        };
+      }
       if ('type' in item) {
         const { sessionId, runId, payload } = item;
+        if (payload.type === 'native.progress') {
+          progress = {
+            ...progress,
+            [sessionId]: { ...progress[sessionId], [payload.taskId]: payload },
+          };
+          continue;
+        }
         if (!isFragment(payload)) continue;
         const last = open?.runId === runId ? open.payload : undefined;
         live[sessionId] =
@@ -520,6 +569,7 @@ export class ProxyClient {
       grouped.set(item.sessionId, events);
     }
     this.streamEvents = [];
+    if (progress !== this.state.progress) this.update({ progress });
     if (moved) this.update({ live });
     for (const [id, events] of grouped) this.merge(id, events);
   }
